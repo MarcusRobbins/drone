@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: run train_live",
+      "type": "python",
+      "request": "launch",
+      "module": "live_mvp.train_live",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

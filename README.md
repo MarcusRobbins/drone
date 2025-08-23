@@ -1,0 +1,44 @@
+
+# live_mvp — Minimal live-map + policy (hash-grid, anchor + compass)
+
+This is a tiny, end-to-end differentiable multi-drone scanning demo. The **only** ground-truth usage is to synthesize depth; **everything** the policy sees and all rewards come from a **live map** learned online:
+
+- `Gθ(x)`: geometry SDF (via a tiny MLP on a **multi‑resolution hash‑grid** encoder)
+- `Qη(x)`: exposure/coverage ∈ [0,1] (same encoder family)
+
+**Policy inputs (no learned featurizer):**
+- **Anchor‑lattice** samples of `[clipped SDF, exposure]` at a small 3D grid around the drone (captures vertical structure / altitude cues).
+- An **“unseen compass”**: per‑direction info‑gain–like potentials from the live map, plus a summarized 3‑vector pointing toward unseen space.
+
+**Differentiable where it matters:** Gradients flow from reward → pose via soft visibility; we **do not** backprop through live-map parameters (map updates are SGD steps with stop‑grad exposure).
+
+---
+
+## Install & run
+
+> **Windows + GPU note:** Native Windows GPU wheels for JAX are not supported; use **WSL2 (Ubuntu)** for GPU, or install the CPU-only environment on Windows. See `install_wsl_gpu.sh` and `install_windows_cpu.bat` in the `scripts/` folder.
+
+```bash
+# In WSL2 (GPU) or Linux:
+bash scripts/install_wsl_gpu.sh
+# Then
+python -m live_mvp.train_live
+```
+
+On Windows CPU-only:
+```bat
+scripts\install_windows_cpu.bat
+# Then (in Anaconda Prompt or VS Code with that env selected):
+python -m live_mvp.train_live
+```
+
+---
+
+## What’s inside
+
+- `env_gt.py` : Analytic GT world (plane + sphere + box) & sphere-traced depth.
+- `live_map.py`: Hash‑grid encoders + tiny MLPs for `Gθ` and `Qη`; **masked** online updates.
+- `render.py`  : Soft visibility, expected hit, incidence, reward terms.
+- `dyn.py`     : Simple differentiable kinematics & quaternion utilities.
+- `policy.py`  : Non‑learned **anchor‑lattice** and **unseen compass** features, and a tiny MLP for the policy.
+- `train_live.py`: Fused `train_step` (JIT/GPU); rollout loop that updates the live map, computes reward **from the live map**, and trains the policy.
