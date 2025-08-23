@@ -2,7 +2,7 @@
 from typing import NamedTuple
 import jax, jax.numpy as jnp
 
-class State(NamedTuple):
+class State(NamedTuple): 
     p: jnp.ndarray; v: jnp.ndarray; q: jnp.ndarray; w: jnp.ndarray
 
 class DynCfg(NamedTuple):
