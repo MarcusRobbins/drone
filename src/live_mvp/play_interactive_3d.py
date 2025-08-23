@@ -17,7 +17,7 @@ Keys:
   H: toggle HOLD (one-tap stop; ignores motion until toggled off)
   P: pause physics   M: toggle mapping   A: toggle live auto-contrast
   1: vis (Q * shell mask)   2: Q (exposure)   3: |phi|   4: shell mask
-  Slider (bottom): minimum density threshold (auto-scaled)
+  Slider (bottom): **maximum** density threshold (auto-scaled; keeps ≤)
   Esc: quit
 
 Run:
@@ -677,7 +677,7 @@ class Interactive3DApp:
         self.live_actor = None
         self.pl.show_axes()
 
-        # Slider (global; controls min threshold over live field)
+        # Slider (global; controls max threshold over live field)
         self.live_slider = None  # created after actors
         self._bind_keys()
 
@@ -786,7 +786,7 @@ class Interactive3DApp:
                                            clim=[0.0, 1.0], cmap="viridis",
                                            nan_color=None, nan_opacity=0.0)  # NaNs invisible
 
-        # Slider widget for min threshold (normalized 0..1 in [lo_hint,hi_hint])
+        # Slider widget for max threshold (normalized 0..1 in [lo_hint,hi_hint])
         try:
             if self.live_slider is not None:
                 self.pl.remove_slider_widget(self.live_slider)
@@ -798,12 +798,12 @@ class Interactive3DApp:
             # place along bottom: pointa/b set in normalized display coords if available
             self.live_slider = self.pl.add_slider_widget(
                 callback=_slider_cb, rng=[0.0, 1.0], value=self.live_thresh_alpha,
-                title="Live Min (auto-scale)", pointa=(0.35, 0.02), pointb=(0.98, 0.02)
+                title="Live Max (keep ≤, auto-scale)", pointa=(0.35, 0.02), pointb=(0.98, 0.02)
             )
         except Exception:
             # fallback without positioning
             self.live_slider = self.pl.add_slider_widget(callback=_slider_cb, rng=[0.0, 1.0],
-                                                         value=self.live_thresh_alpha, title="Live Min (auto-scale)")
+                                                         value=self.live_thresh_alpha, title="Live Max (keep ≤)")
 
     def _update_cam_scalars(self, img: np.ndarray):
         if self.cam_mesh is None or self.cam_actor is None:
@@ -838,10 +838,10 @@ class Interactive3DApp:
         return float(lo + self.live_thresh_alpha * max(0.0, hi - lo))
 
     def _apply_min_mask_to_field(self, field: np.ndarray) -> np.ndarray:
-        """Return a copy with values below threshold set to NaN (hidden)."""
+        """Return a copy with values ABOVE the threshold set to NaN (hidden). Keeps ≤."""
         thr = self._current_thresh_value()
         masked = field.astype(np.float32).copy()
-        masked[field < thr] = np.nan
+        masked[field > thr] = np.nan
         return masked
 
     def _update_live_scalars(self, field: np.ndarray, clim_hint: Optional[list]):
@@ -850,7 +850,7 @@ class Interactive3DApp:
         if self.live_poly is None:
             return
 
-        # NaN-mask out points below threshold
+        # NaN-mask out points ABOVE threshold (keep ≤)
         field_vis = self._apply_min_mask_to_field(field)
 
         pd = self.live_poly.point_data
@@ -891,9 +891,9 @@ class Interactive3DApp:
         # apply to last field immediately for responsiveness
         if self.live_field_last is not None:
             self._update_live_scalars(self.live_field_last, [self.live_lo_hint, self.live_hi_hint])
-        log.info(f"[ui] slider: min threshold alpha={self.live_thresh_alpha:.3f} "
+        log.info(f"[ui] slider: **max** threshold alpha={self.live_thresh_alpha:.3f} "
                  f"→ value={self._current_thresh_value():.4f} "
-                 f"({self.live_field_name})")
+                 f"(keeping ≤ for {self.live_field_name})")
 
     def _update_pose_and_hud(self):
         # Recreate small pose meshes (cheap)
@@ -921,11 +921,11 @@ class Interactive3DApp:
         spd = float(np.linalg.norm(self.v))
         yaw_rate = float(self.w[2])
         mode_name = {0:"vis", 1:"Q", 2:"|phi|", 3:"mask"}.get(self.ctrl.live_mode, "vis")
-        # visible count (best-effort; requires last field)
+        # visible count (<= threshold now)
         vis_cnt = 0
         if self.live_field_last is not None:
             thr = self._current_thresh_value()
-            vis_cnt = int(np.sum(np.isfinite(self.live_field_last) & (self.live_field_last >= thr)))
+            vis_cnt = int(np.sum(np.isfinite(self.live_field_last) & (self.live_field_last <= thr)))
         def on(b): return "●" if b else "○"
         keys_line = (
             f"I{on(self.ctrl.fwd)} K{on(self.ctrl.back)}  "
@@ -942,7 +942,7 @@ class Interactive3DApp:
             f"[steps={self.steps} ~{self.sps:.1f} sps]  "
             f"p=({p[0]:+.2f},{p[1]:+.2f},{p[2]:+.2f})  "
             f"|v|={spd:.2f}  yaw={yaw_rate:.2f}  "
-            f"min_th={self._current_thresh_value():.4f}  "
+            f"max_th(keep ≤)={self._current_thresh_value():.4f}  "
             f"visible≈{vis_cnt}"
             f"\nKeys: {keys_line}"
         )
