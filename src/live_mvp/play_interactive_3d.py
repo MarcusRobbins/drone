@@ -286,39 +286,56 @@ def _sim_worker(ui2sim: mp.Queue, sim2ui: mp.Queue,
             _simlog(f"[sim] camera marcher jit disabled: {e!r}")
             cam_march_fn = lambda o, D: fast_raycast_depth_grid(o, D, S=int(cam_samples))
 
-        # Mapping update (jitted)
-        def _map_update_once(ms: MapState, st: State) -> MapState:
+        # Mapping update (jitted): includes occluded negatives for exposure and diagnostics
+        def _map_update_once(ms: MapState, st: State):
             p, q = st.p, st.q
             Rw = R_from_q(q)
-            dirs_body, _ = camera_dirs_body(n_az=16, n_el=2, fov_az_deg=100., fov_el_deg=40.)
+            # Slightly denser than before: more elevation rows, no stride
+            dirs_body, _ = camera_dirs_body(n_az=24, n_el=4, fov_az_deg=100., fov_el_deg=40.)
             rays_w = (dirs_body @ Rw.T)
-            idx = jnp.arange(0, rays_w.shape[0], 2)
-            sel = rays_w[idx]
-            SFS = 16
+
+            SFS = 24
             ts = jnp.linspace(0.2, 12.0, SFS)
 
             def per_ray(d):
-                t = raycast_depth_gt(p, d)
+                t = raycast_depth_gt(p, d)                        # robust GT raycast
                 stop_t = jnp.where(jnp.isnan(t), 12.0, t)
-                xs = p[None,:] + ts[:,None]*d[None,:]
+                xs = p[None,:] + ts[:,None]*d[None,:]             # (SFS,3)
+                # free-space strictly before the hit
                 m_free = (ts < stop_t).astype(jnp.float32)
-                w_seen = m_free / (1.0 + ts*ts)
+                w_free = m_free / (1.0 + ts*ts)
+                # occluded region strictly behind the hit (bound it to [t_max])
+                m_occ = (ts > stop_t).astype(jnp.float32)
+                w_occ = m_occ / (1.0 + ts*ts)
+                # hit point and mask
                 x_hit = p + stop_t * d
                 m_hit = jnp.isfinite(t).astype(jnp.float32) * (t <= 12.0)
-                return x_hit, m_hit, xs, m_free, w_seen
+                return x_hit, m_hit, xs, m_free, w_free, xs, m_occ, w_occ
 
-            hits, m_hits, frees, m_frees, w_seens = jax.vmap(per_ray)(sel)
+            # Note: returns (hits, m_hits, frees, m_frees, w_frees, occ, m_occ, w_occ)
+            hits, m_hits, frees, m_frees, w_frees, occs, m_occs, w_occs = jax.vmap(per_ray)(rays_w)
+
+            # Diagnostics (counts)
+            n_hit = jnp.sum(m_hits).astype(jnp.int32)
+            n_free = jnp.sum(m_frees).astype(jnp.int32)
+            n_occ = jnp.sum(m_occs).astype(jnp.int32)
+
+            # Update geometry and exposure (with negatives)
             new_map = update_geom(ms, hits, m_hits, frees, m_frees)
-            new_map = update_expo(new_map, frees, w_seens)
-            return _sanitize_mapstate(new_map)
+            new_map = update_expo(new_map, frees, w_frees, occs, w_occs, neg_weight=0.7)
+
+            # Emit a small tuple we can log outside jit
+            return _sanitize_mapstate(new_map), (n_hit, n_free, n_occ)
         try:
             map_update_fn = jax.jit(_map_update_once)
         except Exception as e:
             _simlog(f"[sim] mapping jit disabled: {e!r}")
-            map_update_fn = _map_update_once
+            def map_update_fn(ms, st):
+                nm, counts = _map_update_once(ms, st)
+                return nm, counts
     else:
         _simlog("[sim] JIT disabled")
-        def map_update_fn(ms: MapState, st: State) -> MapState:
+        def map_update_fn(ms: MapState, st: State):
             p, q = st.p, st.q
             Rw = R_from_q(q)
             dirs_body, _ = camera_dirs_body(n_az=16, n_el=2, fov_az_deg=100., fov_el_deg=40.)
@@ -335,11 +352,18 @@ def _sim_worker(ui2sim: mp.Queue, sim2ui: mp.Queue,
                 w_seen = m_free / (1.0 + ts*ts)
                 x_hit = p + stop_t * d
                 m_hit = jnp.isfinite(t).astype(jnp.float32) * (t <= 12.0)
-                return x_hit, m_hit, xs, m_free, w_seen
-            hits, m_hits, frees, m_frees, w_seens = jax.vmap(per_ray)(sel)
+                # also construct occluded weights for diagnostics in non-JIT path
+                m_occ = (ts > stop_t).astype(jnp.float32)
+                w_occ = m_occ / (1.0 + ts*ts)
+                return x_hit, m_hit, xs, m_free, w_seen, xs, m_occ, w_occ
+            hits, m_hits, frees, m_frees, w_seens, occs, m_occs, w_occs = jax.vmap(per_ray)(sel)
             new_map = update_geom(ms, hits, m_hits, frees, m_frees)
-            new_map = update_expo(new_map, frees, w_seens)
-            return _sanitize_mapstate(new_map)
+            new_map = update_expo(new_map, frees, w_seens, occs, w_occs, neg_weight=0.7)
+            # counts
+            n_hit = int(jnp.sum(m_hits))
+            n_free = int(jnp.sum(m_frees))
+            n_occ = int(jnp.sum(m_occs))
+            return _sanitize_mapstate(new_map), (n_hit, n_free, n_occ)
 
     # Jitted pack of live fields to avoid duplicating v_G/v_Q work
     if enable_jit:
@@ -371,7 +395,7 @@ def _sim_worker(ui2sim: mp.Queue, sim2ui: mp.Queue,
             t0 = time.time()
             _ = step_fn(state, jnp.zeros(6, dtype=jnp.float32), cfg)
             _ = cam_march_fn(state.p, cam_dirs)
-            mapstate = map_update_fn(mapstate, state)
+            mapstate, _ = map_update_fn(mapstate, state)
             _ = compute_pack(mapstate.geom.theta, mapstate.expo.eta)
             _simlog(f"[sim] warmup compiled in {time.time()-t0:.2f}s (step+cam+map+pack)")
         except Exception as e:
@@ -452,10 +476,15 @@ def _sim_worker(ui2sim: mp.Queue, sim2ui: mp.Queue,
                     if ctrl.mapping and (steps % int(max(1, map_update_every_steps)) == 0):
                         t0m = time.time()
                         try:
-                            mapstate = map_update_fn(mapstate, state)
+                            mapstate, counts = map_update_fn(mapstate, state)
                         except Exception as e:
                             _simlog(f"[sim] mapping_update error: {e!r}")
                         dtm = time.time() - t0m
+                        try:
+                            ch, cf, co = [int(v) for v in counts]
+                            _simlog(f"[sim] map_update: hits={ch} free={cf} occ={co}")
+                        except Exception:
+                            pass
                         if dtm > 0.25:
                             _simlog(f"[sim] mapping_update took {dtm:.3f}s at step {steps}")
 
