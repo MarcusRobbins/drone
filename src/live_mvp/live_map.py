@@ -1,6 +1,8 @@
 
 from typing import NamedTuple, Optional
+import os
 import jax, jax.numpy as jnp, optax
+from jax import tree_util as jtu
 
 # ---------------------------
 # Multi-resolution hash-grid
@@ -110,6 +112,40 @@ class MapState(NamedTuple):
 _G_OPT_TX = optax.adam(1e-3)
 _E_OPT_TX = optax.adam(1e-3)
 
+# ---------- Debug / safety helpers ----------
+_DBG = os.environ.get("LIVEMVP_DEBUG", "0") in ("1", "true", "True")
+_NO_EIK = os.environ.get("LIVEMVP_NO_EIK", "0") in ("1", "true", "True")
+
+def _dbg_print(do, fmt, *xs):
+    if not _DBG:
+        return
+    do = jnp.asarray(do, dtype=jnp.bool_)
+    def _yes(_):
+        jax.debug.print(fmt, *xs)
+        return 0
+    def _no(_):
+        return 0
+    _ = jax.lax.cond(do, _yes, _no, 0)
+
+def _clean_float(x, max_abs: float = 1e6):
+    x = jnp.asarray(x)
+    if jnp.issubdtype(x.dtype, jnp.inexact):
+        x = jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        x = jnp.clip(x, -max_abs, max_abs)
+    return x
+
+def _tree_stats(tree):
+    leaves = [jnp.asarray(x) for x in jtu.tree_leaves(tree)
+              if hasattr(x, "dtype") and jnp.issubdtype(jnp.asarray(x).dtype, jnp.inexact)]
+    if not leaves:
+        z = jnp.array(0.0, jnp.float32)
+        return z, z, z
+    v = jnp.concatenate([x.reshape(-1) for x in leaves])
+    frac_bad = 1.0 - jnp.mean(jnp.isfinite(v).astype(jnp.float32))
+    rms = jnp.sqrt(jnp.mean(v * v))
+    maxabs = jnp.max(jnp.abs(v))
+    return frac_bad, rms, maxabs
+
 def init_live_map(key):
     k1,k2,k3,k4 = jax.random.split(key, 4)
     tables_g = init_hash_tables(k1, HASH_CFG)
@@ -151,9 +187,11 @@ def update_geom(mapstate: MapState,
             w_hits = hits_mask.astype(jnp.float32)
             l_hit  = (w_hits * (g_hits**2)).sum() / (w_hits.sum() + 1e-6)
             # eikonal near hits (masked)
-            def grad_norm(x): return jnp.linalg.norm(jax.grad(lambda xx: G_phi(xx, params))(x))
-            gn = jax.vmap(grad_norm)(hits_xyz)
-            eik = ((w_hits * (gn - 1.0)**2).sum() / (w_hits.sum() + 1e-6))
+            if not _NO_EIK:
+                def grad_norm(x):
+                    return jnp.linalg.norm(jax.grad(lambda xx: G_phi(xx, params))(x))
+                gn = jax.vmap(grad_norm)(hits_xyz)
+                eik = ((w_hits * (gn - 1.0)**2).sum() / (w_hits.sum() + 1e-6))
 
         # free space
         l_free = 0.0
@@ -163,11 +201,27 @@ def update_geom(mapstate: MapState,
             g_free = v_G(xs, params)
             l_free = (wm * (g_free - mu)**2).sum() / (wm.sum() + 1e-6)
 
-        return l_hit + 0.5*l_free + 0.1*eik
+        # weight eik term unless disabled
+        return l_hit + 0.5*l_free + (0.0 if _NO_EIK else 0.1)*eik
 
+    # grads -> sanitize
     g = jax.grad(loss_fn)(theta)
+    g = jtu.tree_map(_clean_float, g)
+    # opt update -> sanitize
     updates, opt2 = _G_OPT_TX.update(g, opt, theta)
-    theta2 = optax.apply_updates(theta, updates)
+    updates = jtu.tree_map(_clean_float, updates)
+    opt2    = jtu.tree_map(_clean_float, opt2)
+    theta2  = optax.apply_updates(theta, updates)
+    theta2  = jtu.tree_map(_clean_float, theta2)
+
+    # diagnostics
+    gb, grms, gmax = _tree_stats(g)
+    ub, urms, umax = _tree_stats(updates)
+    tb, trms, tmax = _tree_stats(theta2)
+    ob, orms, omax = _tree_stats(opt2)
+    _dbg_print(True,
+               "[lm] geom: g_rms={:.3e} upd_rms={:.3e} theta_rms={:.3e} opt_rms={:.3e} bad[g,u,θ,opt]=({:.3f},{:.3f},{:.3f},{:.3f}) max[θ]={:.3e}",
+               grms, urms, trms, orms, gb, ub, tb, ob, tmax)
     return MapState(GeomState(theta2, opt2), mapstate.expo)
 
 def update_expo(mapstate: MapState,
@@ -202,6 +256,19 @@ def update_expo(mapstate: MapState,
         return loss
 
     g = jax.grad(loss_fn)(eta)
+    g = jtu.tree_map(_clean_float, g)
     updates, opt2 = _E_OPT_TX.update(g, opt, eta)
-    eta2 = optax.apply_updates(eta, updates)
+    updates = jtu.tree_map(_clean_float, updates)
+    opt2    = jtu.tree_map(_clean_float, opt2)
+    eta2    = optax.apply_updates(eta, updates)
+    eta2    = jtu.tree_map(_clean_float, eta2)
+
+    # diagnostics
+    gb, grms, gmax = _tree_stats(g)
+    ub, urms, umax = _tree_stats(updates)
+    eb, erms, emax = _tree_stats(eta2)
+    ob, orms, omax = _tree_stats(opt2)
+    _dbg_print(True,
+               "[lm] expo: g_rms={:.3e} upd_rms={:.3e} eta_rms={:.3e} opt_rms={:.3e} bad[g,u,η,opt]=({:.3f},{:.3f},{:.3f},{:.3f}) max[η]={:.3e}",
+               grms, urms, erms, orms, gb, ub, eb, ob, emax)
     return MapState(mapstate.geom, ExpoState(eta2, opt2))
