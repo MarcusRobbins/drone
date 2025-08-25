@@ -44,13 +44,16 @@ def close_weight(r, rcfg):
 def recon_reward_for_ray(o, d, theta, eta, rcfg: RenderCfg):
     d = d/(jnp.linalg.norm(d)+1e-9)
     xh, seen, xs, T, alpha = expected_hit_live(o, d, theta, rcfg)
-    # normals from live SDF
-    n = jax.grad(G_phi)(xh, theta); n = n/(jnp.linalg.norm(n)+1e-9)
+    # normals from live SDF (stop grad through the normal to avoid brittle 2nd-order paths)
+    n = jax.grad(G_phi)(xh, theta)
+    n_hat = n/(jnp.linalg.norm(n)+1e-9)
+    n_hat = jax.lax.stop_gradient(n_hat)
     v = -d
-    cos_inc = jnp.abs(jnp.dot(n, v))
+    cos_inc = jnp.abs(jnp.dot(n_hat, v))
     dist = jnp.linalg.norm(xh - o)
-    w_inc = incidence_weight(cos_inc, rcfg)
-    w_close = close_weight(dist, rcfg)
+    # small floors keep signal alive early
+    w_inc = 0.2 + 0.8 * incidence_weight(cos_inc, rcfg)
+    w_close = 0.2 + 0.8 * close_weight(dist, rcfg)
     # unseen from live exposure
     E = Q_expo(xh, eta)
     w_unseen = (1.0 - jax.lax.stop_gradient(E)) ** rcfg.unseen_gamma

@@ -63,6 +63,9 @@ class SimCfg(NamedTuple):
     w_coll: float = 4.0
     margin: float = 0.12
     w_ctrl: float = 0.01
+    # --- NEW: explicit reward weight & exploration noise ---
+    w_recon: float = 1.0         # scales reconstruction reward (higher → explore)
+    act_noise: float = 0.0       # stddev of Gaussian action noise (0 disables)
 
 
 def soft_collision_live(p, theta, margin):
@@ -150,6 +153,11 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
         obs_nan = frac_nonfinite(obs)
         # Pass params explicitly so JAX sees dependency and propagates grads
         u_raw = jax.vmap(mlp_apply, in_axes=(None, 0))(pp, obs)
+        # --- Optional exploration noise on actions (static branch under jit) ---
+        if sim.act_noise > 0.0:
+            key, key_n = jax.random.split(key)
+            noise = sim.act_noise * jax.random.normal(key_n, u_raw.shape)
+            u_raw = u_raw + noise
 
         # Obs / action stats (cadenced)
         def _stats(x):
@@ -196,7 +204,7 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
         coll_raw  = coll.mean()
         ctrl_raw  = ctrl.mean()
         # --- base loss
-        loss_raw  = sim.w_coll * coll_raw + sim.w_ctrl * ctrl_raw - recon_raw
+        loss_raw  = sim.w_coll * coll_raw + sim.w_ctrl * ctrl_raw - sim.w_recon * recon_raw
         # --- debug: isolate the ctrl term to confirm gradient flow
         if bool(int(os.environ.get("LIVEMVP_DEBUG_CTRL_ONLY", "0"))):
             loss_raw = sim.w_ctrl * ctrl_raw
@@ -251,16 +259,34 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
 # -------------
 # JIT-fused training step (GPU-resident)
 # -------------
-POLICY_OPT = optax.adam(3e-3)
+POLICY_OPT = optax.chain(
+    optax.clip_by_global_norm(1.0),
+    optax.adam(3e-3),
+)
 
 
 def _tree_rms(tree):
-    leaves, _ = jtu.tree_flatten(tree)
+    leaves = [jnp.asarray(x) for x in jtu.tree_leaves(tree)
+              if hasattr(x, "dtype") and jnp.issubdtype(jnp.asarray(x).dtype, jnp.inexact)]
     if not leaves:
-        return jnp.array(0.0, dtype=jnp.float32)
-    num = sum(jnp.sum(jnp.square(jnp.asarray(x))) for x in leaves)
-    den = sum(jnp.size(jnp.asarray(x)) for x in leaves)
-    return jnp.sqrt(num / (den + 1e-9))
+        return jnp.array(0.0, jnp.float32)
+    vec = jnp.concatenate([x.reshape(-1) for x in leaves])
+    return jnp.sqrt(jnp.mean(vec * vec))
+
+def _tree_maxabs(tree):
+    leaves = [jnp.asarray(x) for x in jtu.tree_leaves(tree)
+              if hasattr(x, "dtype") and jnp.issubdtype(jnp.asarray(x).dtype, jnp.inexact)]
+    if not leaves:
+        return jnp.array(0.0, jnp.float32)
+    return jnp.max(jnp.concatenate([jnp.abs(x).reshape(-1) for x in leaves]))
+
+def _frac_finite(tree):
+    leaves = [jnp.asarray(x) for x in jtu.tree_leaves(tree)
+              if hasattr(x, "dtype") and jnp.issubdtype(jnp.asarray(x).dtype, jnp.inexact)]
+    if not leaves:
+        return jnp.array(1.0, jnp.float32)
+    vec = jnp.concatenate([x.reshape(-1) for x in leaves])
+    return jnp.mean(jnp.isfinite(vec).astype(jnp.float32))
 
 
 def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimCfg):
@@ -302,8 +328,12 @@ def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimC
                 jnp.array(pre_rms, jnp.float32))
     gleaf_ratio, gfinite_frac, gmaxabs, gpre_rms = _grad_tree_stats(grads)
 
-    # sanitize grads (rarely needed, but safe)
-    grads = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), grads)
+    # Extra grad norms
+    grad_norm_pre = optax.global_norm(grads)
+
+    # sanitize grads (NaN/Inf -> 0) and clip by value to be safe
+    grads = jax.tree.map(lambda g: jnp.clip(jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), -1e3, 1e3), grads)
+    grad_norm = optax.global_norm(grads)
 
     updates, opt_state = POLICY_OPT.update(grads, opt_state, policy_params)
     policy_params = optax.apply_updates(policy_params, updates)
@@ -311,6 +341,8 @@ def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimC
     grad_rms = _tree_rms(grads)
     param_rms = _tree_rms(policy_params)
     update_rms = _tree_rms(updates)
+    update_norm = optax.global_norm(updates)
+    update_max = _tree_maxabs(updates)
     metrics = dict(
         metrics,
         grad_rms=jnp.nan_to_num(grad_rms, nan=0.0, posinf=0.0, neginf=0.0),
@@ -320,6 +352,10 @@ def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimC
         grad_finite_frac=gfinite_frac,        # <1 → NaNs/±Inf pre-sanitize
         grad_pre_maxabs=gmaxabs,              # large → potential explosion
         grad_pre_rms=gpre_rms,                # RMS before sanitization
+        grad_norm=jnp.nan_to_num(grad_norm, nan=0.0, posinf=0.0, neginf=0.0),
+        grad_norm_pre=jnp.nan_to_num(grad_norm_pre, nan=0.0, posinf=0.0, neginf=0.0),
+        update_norm=jnp.nan_to_num(update_norm, nan=0.0, posinf=0.0, neginf=0.0),
+        update_max=jnp.nan_to_num(update_max, nan=0.0, posinf=0.0, neginf=0.0),
     )
     return policy_params, opt_state, mapstate_new, loss, metrics
 
@@ -363,6 +399,27 @@ def main(argv: Optional[list] = None):
     parser.add_argument("--timing", action="store_true", help="Print timing each iteration and summary.")
     parser.add_argument("--profile", type=str, default="", help="Start TensorBoard trace to this directory.")
     parser.add_argument("--csv", type=str, default="", help="Write per-iter metrics to CSV.")
+    # ----- Presets -----
+    parser.add_argument("--preset", type=str, default=None,
+                        choices=["safe", "coverage", "aggressive", "photometric", "debug-ctrl"],
+                        help="Load a preset of reward/shaping knobs (overridable by flags).")
+    # ----- Objective weights / safety -----
+    parser.add_argument("--w-coll", type=float, default=None, help="Collision penalty weight.")
+    parser.add_argument("--w-ctrl", type=float, default=None, help="Control L2 penalty weight.")
+    parser.add_argument("--w-recon", type=float, default=None, help="Reconstruction reward weight.")
+    parser.add_argument("--margin", type=float, default=None, help="Soft collision margin (m).")
+    parser.add_argument("--act-noise", type=float, default=None, help="Stddev of Gaussian action noise.")
+    # ----- Render/reward shaping (reconstruction) -----
+    parser.add_argument("--eps-shell", type=float, default=None, help="SDF→sigma shell thickness.")
+    parser.add_argument("--theta-min", type=float, default=None, help="Min incidence angle (deg).")
+    parser.add_argument("--theta-max", type=float, default=None, help="Max incidence angle (deg).")
+    parser.add_argument("--tau-theta", type=float, default=None, help="Incidence gating softness.")
+    parser.add_argument("--r0", type=float, default=None, help="Distance falloff midpoint.")
+    parser.add_argument("--tau-r", type=float, default=None, help="Distance falloff softness.")
+    parser.add_argument("--unseen-gamma", type=float, default=None, help="Exponent on (1 - exposure).")
+    parser.add_argument("--samples", type=int, default=None, help="Samples per ray for recon reward.")
+    parser.add_argument("--t0", type=float, default=None, help="Near bound for rays.")
+    parser.add_argument("--t1", type=float, default=None, help="Far bound for rays.")
     args = parser.parse_args(argv)
 
     # Prefer to place initial arrays directly on GPU if available
@@ -385,7 +442,71 @@ def main(argv: Optional[list] = None):
         policy_params = init_mlp(jax.random.PRNGKey(2), [obs_dim, 64, 64, 6])  # -> [ax,ay,az,wx,wy,wz]
         opt_state = POLICY_OPT.init(policy_params)
 
-    sim = SimCfg(steps=int(max(1, args.steps)))
+    def _apply_preset(name, rcfg: RenderCfg, sim: SimCfg):
+        if name == "safe":
+            rcfg = rcfg._replace(
+                eps_shell=0.20, theta_min_deg=0.0, theta_max_deg=75.0, tau_theta=0.10,
+                r0=3.5, tau_r=1.0, unseen_gamma=1.2, S=64, t0=0.2, t1=12.0
+            )
+            sim = sim._replace(w_recon=2.0, w_ctrl=0.001, w_coll=3.0, margin=0.12, act_noise=0.10)
+        elif name == "coverage":
+            rcfg = rcfg._replace(
+                eps_shell=0.22, theta_min_deg=0.0, theta_max_deg=78.0, tau_theta=0.10,
+                r0=4.0, tau_r=1.2, unseen_gamma=1.1, S=64, t0=0.2, t1=12.0
+            )
+            sim = sim._replace(w_recon=3.0, w_ctrl=0.0005, w_coll=2.0, margin=0.10, act_noise=0.15)
+        elif name == "aggressive":
+            rcfg = rcfg._replace(
+                eps_shell=0.20, theta_min_deg=0.0, theta_max_deg=80.0, tau_theta=0.08,
+                r0=5.0, tau_r=1.3, unseen_gamma=1.0, S=48, t0=0.2, t1=12.0
+            )
+            sim = sim._replace(w_recon=4.0, w_ctrl=0.0003, w_coll=1.5, margin=0.08, act_noise=0.20)
+        elif name == "photometric":
+            rcfg = rcfg._replace(
+                eps_shell=0.18, theta_min_deg=10.0, theta_max_deg=60.0, tau_theta=0.08,
+                r0=2.8, tau_r=0.8, unseen_gamma=1.4, S=72, t0=0.2, t1=12.0
+            )
+            sim = sim._replace(w_recon=1.5, w_ctrl=0.0015, w_coll=4.0, margin=0.14, act_noise=0.05)
+        elif name == "debug-ctrl":
+            rcfg = rcfg._replace(S=48)
+            sim = sim._replace(w_recon=0.0, w_ctrl=0.01, w_coll=3.0, margin=0.12, act_noise=0.0)
+        return rcfg, sim
+
+    # ----- Build RenderCfg and SimCfg -----
+    rcfg = RenderCfg()
+    sim = SimCfg(steps=int(max(1, args.steps)), rcfg=rcfg)
+
+    # Apply preset first (if any)
+    if args.preset is not None:
+        rcfg, sim = _apply_preset(args.preset, rcfg, sim)
+        sim = sim._replace(rcfg=rcfg)
+
+    # Apply explicit CLI overrides (these take precedence over presets)
+    if args.eps_shell is not None:    rcfg = rcfg._replace(eps_shell=float(args.eps_shell))
+    if args.theta_min is not None:    rcfg = rcfg._replace(theta_min_deg=float(args.theta_min))
+    if args.theta_max is not None:    rcfg = rcfg._replace(theta_max_deg=float(args.theta_max))
+    if args.tau_theta is not None:    rcfg = rcfg._replace(tau_theta=float(args.tau_theta))
+    if args.r0 is not None:           rcfg = rcfg._replace(r0=float(args.r0))
+    if args.tau_r is not None:        rcfg = rcfg._replace(tau_r=float(args.tau_r))
+    if args.unseen_gamma is not None: rcfg = rcfg._replace(unseen_gamma=float(args.unseen_gamma))
+    if args.samples is not None:      rcfg = rcfg._replace(S=int(args.samples))
+    if args.t0 is not None:           rcfg = rcfg._replace(t0=float(args.t0))
+    if args.t1 is not None:           rcfg = rcfg._replace(t1=float(args.t1))
+    sim = sim._replace(rcfg=rcfg)
+
+    if args.w_coll is not None:       sim = sim._replace(w_coll=float(args.w_coll))
+    if args.w_ctrl is not None:       sim = sim._replace(w_ctrl=float(args.w_ctrl))
+    if args.w_recon is not None:      sim = sim._replace(w_recon=float(args.w_recon))
+    if args.margin is not None:       sim = sim._replace(margin=float(args.margin))
+    if args.act_noise is not None:    sim = sim._replace(act_noise=float(args.act_noise))
+
+    # small banner so runs are self-describing
+    print(f"[cfg] preset={args.preset or 'none'} | "
+          f"Sim: steps={sim.steps}  w_coll={sim.w_coll}  w_ctrl={sim.w_ctrl}  "
+          f"w_recon={sim.w_recon}  margin={sim.margin}  act_noise={sim.act_noise}")
+    print(f"[cfg] R: t0={sim.rcfg.t0} t1={sim.rcfg.t1} S={sim.rcfg.S} eps={sim.rcfg.eps_shell}  "
+          f"θ∈[{sim.rcfg.theta_min_deg},{sim.rcfg.theta_max_deg}] τθ={sim.rcfg.tau_theta}  "
+          f"r0={sim.rcfg.r0} τr={sim.rcfg.tau_r}  γ_unseen={sim.rcfg.unseen_gamma}")
 
     # Optional TensorBoard trace
     tracedir = args.profile.strip()
@@ -444,6 +565,10 @@ def main(argv: Optional[list] = None):
         gfin_f   = float(metrics.get("grad_finite_frac", 1.0))
         gpremax  = float(metrics.get("grad_pre_maxabs", 0.0))
         gprerms  = float(metrics.get("grad_pre_rms", 0.0))
+        gnorm    = float(metrics.get("grad_norm", 0.0))
+        gnormpre = float(metrics.get("grad_norm_pre", 0.0))
+        unorm    = float(metrics.get("update_norm", 0.0))
+        umax     = float(metrics.get("update_max", 0.0))
 
         env_steps = sim.steps / max(1e-9, dt)
         drone_steps = (sim.steps * states0.p.shape[0]) / max(1e-9, dt)
@@ -455,8 +580,9 @@ def main(argv: Optional[list] = None):
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
                 f"u_rms={urms_f:.3e} (u_nan={u_nan_f:.0f}) | obs_nan={obs_nan_f:.3f} | "
-                f"gprobe={gprobe_f:.3e} | grad={grads_f:.3e} | upd={up_f:.3e} | prm={prms_f:.3e} | "
-                f"gpre={gprerms:.3e} gfin={gfin_f:.2f} gleaf={gleaf_f:.2f} gmax={gpremax:.2e}",
+                f"gprobe={gprobe_f:.3e} | grad_rms={grads_f:.3e} | grad_norm={gnorm:.3e} "
+                f"(pre={gnormpre:.3e}, finite={gfin_f:.2f}, gmax={gpremax:.2e}) | "
+                f"upd_rms={up_f:.3e} | upd_norm={unorm:.3e} | upd_max={umax:.2e} | prm={prms_f:.3e}",
                 flush=True,
             )
         elif (it % 20 == 0) or (it == 1):
@@ -465,8 +591,9 @@ def main(argv: Optional[list] = None):
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
                 f"u_rms={urms_f:.3e} (u_nan={u_nan_f:.0f}) | obs_nan={obs_nan_f:.3f} | "
-                f"gprobe={gprobe_f:.3e} | grad={grads_f:.3e} | upd={up_f:.3e} | prm={prms_f:.3e} | "
-                f"gpre={gprerms:.3e} gfin={gfin_f:.2f} gleaf={gleaf_f:.2f} gmax={gpremax:.2e}",
+                f"gprobe={gprobe_f:.3e} | grad_rms={grads_f:.3e} | grad_norm={gnorm:.3e} "
+                f"(pre={gnormpre:.3e}, finite={gfin_f:.2f}, gmax={gpremax:.2e}) | "
+                f"upd_rms={up_f:.3e} | upd_norm={unorm:.3e} | upd_max={umax:.2e} | prm={prms_f:.3e}",
                 flush=True,
             )
 
