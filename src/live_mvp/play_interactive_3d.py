@@ -165,6 +165,12 @@ def _sim_worker(ui2sim: mp.Queue, sim2ui: mp.Queue,
 
     import jax, jax.numpy as jnp
     from jax import tree_util as jtu
+    # Persistent cache (no XLA flags). Logging goes via sim->ui.
+    try:
+        from .jax_cache import enable_persistent_cache
+        _simlog("[sim] " + enable_persistent_cache())
+    except Exception as _e:
+        _simlog("[sim] cache init failed: " + repr(_e))
 
     from .env_gt import phi_gt, raycast_depth_gt
     from .dyn import State, DynCfg, step, R_from_q

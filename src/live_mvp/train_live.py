@@ -153,11 +153,19 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
         obs_nan = frac_nonfinite(obs)
         # Pass params explicitly so JAX sees dependency and propagates grads
         u_raw = jax.vmap(mlp_apply, in_axes=(None, 0))(pp, obs)
-        # --- Optional exploration noise on actions (static branch under jit) ---
-        if sim.act_noise > 0.0:
-            key, key_n = jax.random.split(key)
-            noise = sim.act_noise * jax.random.normal(key_n, u_raw.shape)
-            u_raw = u_raw + noise
+        # --- Optional exploration noise on actions (JAX-safe branch) ---
+        def _add_noise(u_and_key):
+            u, k = u_and_key
+            k, k_n = jax.random.split(k)
+            sigma = jnp.asarray(sim.act_noise, dtype=u.dtype)
+            n = sigma * jax.random.normal(k_n, u.shape)
+            return (u + n, k)
+
+        def _no_noise(u_and_key):
+            return u_and_key
+
+        pred = jnp.asarray(sim.act_noise > 0.0, jnp.bool_)
+        (u_raw, key) = jax.lax.cond(pred, _add_noise, _no_noise, (u_raw, key))
 
         # Obs / action stats (cadenced)
         def _stats(x):
@@ -360,9 +368,12 @@ def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimC
     return policy_params, opt_state, mapstate_new, loss, metrics
 
 
-# JIT-compiled variant (used when it helps)
-@partial(jax.jit, static_argnames=("sim",), donate_argnums=(0, 1, 2))
-def _train_step_jit(policy_params, opt_state, mapstate, states0, key, sim: SimCfg):
+# JIT-compiled variant where ONLY shape-relevant bits are static.
+# This avoids recompiles when tweaking weights/presets.
+@partial(jax.jit, static_argnames=("steps", "samples"), donate_argnums=(0, 1, 2))
+def _train_step_jit(policy_params, opt_state, mapstate, states0, key,
+                    sim: SimCfg, steps: int, samples: int):
+    sim = sim._replace(steps=int(steps), rcfg=sim.rcfg._replace(S=int(samples)))
     return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim)
 
 
@@ -386,7 +397,8 @@ def train_step(policy_params, opt_state, mapstate, states0, key, sim: SimCfg):
     backend = jax.default_backend()
     use_jit = (backend in ("cuda", "rocm")) or (sim.steps >= 20)
     if use_jit:
-        return _train_step_jit(policy_params, opt_state, mapstate, states0, key, sim)
+        return _train_step_jit(policy_params, opt_state, mapstate, states0, key,
+                               sim, int(sim.steps), int(sim.rcfg.S))
     else:
         return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim)
 
@@ -421,6 +433,13 @@ def main(argv: Optional[list] = None):
     parser.add_argument("--t0", type=float, default=None, help="Near bound for rays.")
     parser.add_argument("--t1", type=float, default=None, help="Far bound for rays.")
     args = parser.parse_args(argv)
+
+    # Enable persistent compilation cache if available (no XLA flags needed).
+    try:
+        from .jax_cache import enable_persistent_cache
+        print("[cache]", enable_persistent_cache())
+    except Exception as _e:
+        print("[cache] init failed:", repr(_e))
 
     # Prefer to place initial arrays directly on GPU if available
     dev = _pick_first_device()
