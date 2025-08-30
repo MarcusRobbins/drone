@@ -626,6 +626,17 @@ def main(argv: Optional[list] = None):
     parser.add_argument("--viz", action="store_true", help="Enable basic viewer (GT + drone markers).")
     parser.add_argument("--viz-steps", type=int, default=None, help="Frames per snapshot (default: --steps).")
     parser.add_argument("--viz-every", type=int, default=1, help="Emit a snapshot every K iterations (default: 1).")
+    # ----- Metrics live viewer -----
+    parser.add_argument("--viz-metrics", action="store_true",
+                        help="Open a live metrics window (loss and selected scalars).")
+    parser.add_argument("--metrics-every", type=int, default=1,
+                        help="Send metrics to the viewer every K iterations (default: 1).")
+    parser.add_argument("--metrics-window", type=int, default=5000,
+                        help="Max points retained in metrics plot (default: 5000).")
+    parser.add_argument("--metrics-ema", type=float, default=0.0,
+                        help="EMA alpha in [0,1]; 0 disables smoothing (default: 0.0).")
+    parser.add_argument("--metrics-series", type=str, default="loss",
+                        help="Comma-separated scalar names to plot (default: 'loss').")
     args = parser.parse_args(argv)
 
     # Enable persistent compilation cache if available (no XLA flags needed).
@@ -675,6 +686,8 @@ def main(argv: Optional[list] = None):
     # ---- Optional viewer: start subprocess and send GT once ----
     viz_q = None
     viz_proc = None
+    metrics_q = None
+    metrics_proc = None
     if args.viz:
         try:
             mp.set_start_method("spawn")
@@ -722,6 +735,36 @@ def main(argv: Optional[list] = None):
                 viz_q.put({"type": "init", "gt_points": gt_pts, "goal_points": goal_pts, "lb": lb, "ub": ub})
             except Exception as e:
                 print(f"[viz] send init failed: {e!r}")
+
+    # ---- Metrics viewer ----
+    if args.viz_metrics:
+        try:
+            if not args.viz:
+                try:
+                    mp.set_start_method("spawn")
+                except RuntimeError:
+                    pass
+            from .viz_metrics import run_metrics
+            metrics_q = mp.Queue(maxsize=64)
+            metrics_proc = mp.Process(target=run_metrics, args=(metrics_q,), daemon=True)
+            metrics_proc.start()
+            print("[metrics] viewer started")
+            series = [s.strip() for s in (args.metrics_series or "").split(",") if s.strip()]
+            init_msg = {
+                "type": "init",
+                "series": series or ["loss"],
+                "window": int(max(100, args.metrics_window)),
+                "ema": float(max(0.0, min(1.0, args.metrics_ema))),
+                "title": "live_mvp | training metrics",
+            }
+            try:
+                metrics_q.put_nowait(init_msg)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[metrics] failed to start viewer: {e!r}")
+            metrics_q = None
+            metrics_proc = None
 
     def _apply_preset(name, rcfg: RenderCfg, sim: SimCfg):
         if name == "safe":
@@ -900,6 +943,31 @@ def main(argv: Optional[list] = None):
         drone_steps = (sim.steps * states0.p.shape[0]) / max(1e-9, dt)
 
         # When --timing is set, print EVERY iteration so cadence is visible
+        if metrics_q is not None and (it % max(1, int(args.metrics_every)) == 0):
+            try:
+                scalars_payload = {
+                    "loss": loss_f,
+                    "recon": recon_f,
+                    "coll": coll_f,
+                    "ctrl": ctrl_f,
+                    "u_rms": urms_f,
+                    "grad_rms": grads_f,
+                }
+                msg = {"type": "metrics", "iter": int(it), "scalars": scalars_payload}
+                try:
+                    metrics_q.put_nowait(msg)
+                except Exception:
+                    try:
+                        _ = metrics_q.get_nowait()
+                    except Exception:
+                        pass
+                    try:
+                        metrics_q.put_nowait(msg)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[metrics] send failed at iter {it}: {e!r}")
+
         if args.timing:
             cws = float(metrics.get("coll_w_scale", 1.0))
             spd = float(metrics.get("speed_rms", 0.0))
@@ -996,6 +1064,11 @@ def main(argv: Optional[list] = None):
     if 'viz_q' in locals() and viz_q is not None:
         try:
             viz_q.put({"type": "bye"})
+        except Exception:
+            pass
+    if 'metrics_q' in locals() and metrics_q is not None:
+        try:
+            metrics_q.put({"type": "bye"})
         except Exception:
             pass
 
