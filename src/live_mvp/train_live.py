@@ -3,6 +3,8 @@ from typing import NamedTuple, Optional
 import argparse, time, os, sys
 import jax, jax.numpy as jnp, optax
 from jax import tree_util as jtu
+import multiprocessing as mp
+import numpy as np
 
 from .env_gt import raycast_depth_gt
 from .live_map import init_live_map, update_geom, update_expo, MapState, GeomState, ExpoState
@@ -438,6 +440,62 @@ def train_step(policy_params, opt_state, mapstate, states0, key, sim: SimCfg):
         return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim)
 
 
+# ---------- Basic viewer helpers ----------
+def _gt_shell_points(eps=0.08, res=(80, 80, 40)):
+    """Return (M,3) GT shell points |phi_gt|<=eps on a regular grid."""
+    import jax, jax.numpy as jnp
+    from .env_gt import phi_gt
+    from .live_map import HASH_CFG
+    lb = jnp.asarray(HASH_CFG.lb)
+    ub = jnp.asarray(HASH_CFG.ub)
+    nx, ny, nz = res
+    xs = jnp.linspace(lb[0], ub[0], nx)
+    ys = jnp.linspace(lb[1], ub[1], ny)
+    zs = jnp.linspace(lb[2], ub[2], nz)
+    X, Y, Z = jnp.meshgrid(xs, ys, zs, indexing='xy')
+    pts = jnp.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+    phi = jax.vmap(phi_gt)(pts)
+    mask = jnp.abs(phi) <= float(eps)
+    pts_np = np.asarray(jax.device_get(pts))
+    m_np = np.asarray(jax.device_get(mask))
+    return pts_np[m_np].astype(np.float32)
+
+
+@partial(jax.jit, static_argnames=("steps",))
+def _rollout_for_viz(policy_params, mapstate, states0, key, sim: SimCfg, steps: int):
+    """Forward-only rollout that returns (T,N,3) positions and (T,N,4) quats."""
+    N = states0.p.shape[0]
+
+    def embed_one(st_i, Rw_i):
+        anch = anchor_features(st_i.p, st_i.q, mapstate.geom.theta, mapstate.expo.eta)
+        pot, vec = unseen_compass_features(
+            st_i.p, st_i.q, mapstate.geom.theta, mapstate.expo.eta, sim.rcfg
+        )
+        fwd = jnp.einsum('ij,j->i', Rw_i, jnp.array([1.0, 0.0, 0.0]))
+        return jnp.concatenate([st_i.p, st_i.v, fwd, anch, pot, vec])
+
+    def body(carry, t):
+        key, states = carry
+        Rws = jax.vmap(R_from_q)(states.q)
+        obs = jax.vmap(
+            lambda i: embed_one(
+                State(states.p[i], states.v[i], states.q[i], states.w[i]), Rws[i]
+            )
+        )(jnp.arange(N))
+        u_raw = jax.vmap(mlp_apply, in_axes=(None, 0))(policy_params, obs)
+        p1 = jax.vmap(lambda st, u: step(st, u, sim.dyn).p)(states, u_raw)
+        v1 = jax.vmap(lambda st, u: step(st, u, sim.dyn).v)(states, u_raw)
+        q1 = jax.vmap(lambda st, u: step(st, u, sim.dyn).q)(states, u_raw)
+        w1 = jax.vmap(lambda st, u: step(st, u, sim.dyn).w)(states, u_raw)
+        states1 = State(p1, v1, q1, w1)
+        return (key, states1), (p1, q1)
+
+    (_, states_f), (p_seq, q_seq) = jax.lax.scan(
+        body, (key, states0), jnp.arange(int(steps))
+    )
+    return p_seq, q_seq
+
+
 def main(argv: Optional[list] = None):
     parser = argparse.ArgumentParser(description="Train live_mvp policy with timing.")
     parser.add_argument("--drones", type=int, default=2, help="Number of drones N.")
@@ -471,6 +529,10 @@ def main(argv: Optional[list] = None):
     parser.add_argument("--goal-w", type=float, default=None, help="Weight of the goal reward.")
     parser.add_argument("--goal-sigma", type=float, default=None, help="Sigma (m) for exp(-d^2/(2 sigma^2)).")
     parser.add_argument("--goal-radius", type=float, default=None, help="Ring radius (m) for per-drone targets.")
+    # ----- Basic training viewer -----
+    parser.add_argument("--viz", action="store_true", help="Enable basic viewer (GT + drone markers).")
+    parser.add_argument("--viz-steps", type=int, default=None, help="Frames per snapshot (default: --steps).")
+    parser.add_argument("--viz-every", type=int, default=1, help="Emit a snapshot every K iterations (default: 1).")
     args = parser.parse_args(argv)
 
     # Enable persistent compilation cache if available (no XLA flags needed).
@@ -499,6 +561,41 @@ def main(argv: Optional[list] = None):
         obs_dim = 3 + 3 + 3 + ANCHOR_FEAT_DIM + COMPASS_M + 3  # p, v, fwd, anchors, compass bins, compass vec
         policy_params = init_mlp(jax.random.PRNGKey(2), [obs_dim, 64, 64, 6])  # -> [ax,ay,az,wx,wy,wz]
         opt_state = POLICY_OPT.init(policy_params)
+
+    # ---- Optional viewer: start subprocess and send GT once ----
+    viz_q = None
+    viz_proc = None
+    if args.viz:
+        try:
+            mp.set_start_method("spawn")
+        except RuntimeError:
+            pass
+        try:
+            from .viz_train_basic import run_viz_basic
+            viz_q = mp.Queue(maxsize=2)
+            viz_proc = mp.Process(target=run_viz_basic, args=(viz_q,), daemon=True)
+            viz_proc.start()
+        except Exception as e:
+            print(f"[viz] failed to start viewer: {e!r}")
+            viz_q = None
+            viz_proc = None
+        if viz_q is not None:
+            try:
+                gt_pts = _gt_shell_points(eps=0.08, res=(80, 80, 40))
+            except Exception as e:
+                print(f"[viz] GT shell compute failed: {e!r}")
+                gt_pts = np.zeros((0, 3), np.float32)
+            try:
+                from .live_map import HASH_CFG
+                lb = np.asarray(HASH_CFG.lb, np.float32)
+                ub = np.asarray(HASH_CFG.ub, np.float32)
+            except Exception:
+                lb = np.array([-6.0, -6.0, 0.0], np.float32)
+                ub = np.array([+6.0, +6.0, 4.0], np.float32)
+            try:
+                viz_q.put({"type": "init", "gt_points": gt_pts, "lb": lb, "ub": ub})
+            except Exception as e:
+                print(f"[viz] send init failed: {e!r}")
 
     def _apply_preset(name, rcfg: RenderCfg, sim: SimCfg):
         if name == "safe":
@@ -677,6 +774,29 @@ def main(argv: Optional[list] = None):
                 flush=True,
             )
 
+        # ---- Viewer snapshot ----
+        if viz_q is not None and (it % max(1, int(args.viz_every)) == 0):
+            try:
+                viz_steps = int(args.viz_steps) if args.viz_steps is not None else int(sim.steps)
+                key, sub_v = jax.random.split(key)
+                p_seq_dev, q_seq_dev = _rollout_for_viz(policy_params, mapstate, states0, sub_v, sim, viz_steps)
+                p_seq = np.asarray(jax.device_get(p_seq_dev))
+                q_seq = np.asarray(jax.device_get(q_seq_dev))
+                msg = {"type": "traj", "p": p_seq, "q": q_seq, "dt": float(sim.dyn.dt)}
+                try:
+                    viz_q.put_nowait(msg)
+                except Exception:
+                    try:
+                        _ = viz_q.get_nowait()
+                    except Exception:
+                        pass
+                    try:
+                        viz_q.put_nowait(msg)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[viz] snapshot failed at iter {it}: {e!r}")
+
         if csv_fh:
             csv_fh.write(
                 f"{it},{dt*1e3:.3f},{wall*1e3:.3f},{gap*1e3:.3f},"
@@ -709,6 +829,13 @@ def main(argv: Optional[list] = None):
             print(f"[trace] TensorBoard trace written to: {tracedir}")
         except Exception as e:
             print(f"[trace] Failed to stop trace: {e!r}")
+
+    # Friendly shutdown for viewer
+    if 'viz_q' in locals() and viz_q is not None:
+        try:
+            viz_q.put({"type": "bye"})
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
