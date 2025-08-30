@@ -77,6 +77,9 @@ class BasicTrainViewer:
         self.gt_actor = None
         self.gt_poly: Optional[pv.PolyData] = None
 
+        self.goal_poly: Optional[pv.PolyData] = None
+        self.goal_actor = None
+
         self.drone_poly: Optional[pv.PolyData] = None
         self.drone_actor = None
 
@@ -174,6 +177,23 @@ class BasicTrainViewer:
             self.gt_poly, color="lightgray", render_points_as_spheres=True, point_size=4.5
         )
 
+    def set_goal_points(self, pts: np.ndarray):
+        pts = np.asarray(pts, np.float32)
+        try:
+            if self.goal_actor is not None:
+                self.pl.remove_actor(self.goal_actor)
+        except Exception:
+            pass
+        if pts.size == 0:
+            self.goal_poly = None
+            self.goal_actor = None
+            return
+        self.goal_poly = make_point_cloud_polydata(pts)
+        # Distinct color & size for goals
+        self.goal_actor = self.pl.add_mesh(
+            self.goal_poly, color="gold", render_points_as_spheres=True, point_size=12.0
+        )
+
     def ensure_drone_poly(self, N: int):
         if self.drone_poly is not None and self.drone_poly.n_points == N:
             return
@@ -233,6 +253,8 @@ class BasicTrainViewer:
                     self.ub = np.asarray(m.get("ub", self.ub), np.float32)
                     pts = np.asarray(m.get("gt_points", np.zeros((0, 3), np.float32)), np.float32)
                     self.set_gt_points(pts)
+                    goals = np.asarray(m.get("goal_points", np.zeros((0, 3), np.float32)), np.float32)
+                    self.set_goal_points(goals)
                 elif tp == "traj":
                     p = np.asarray(m["p"], np.float32)
                     qv = m.get("q", None)

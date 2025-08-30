@@ -585,6 +585,23 @@ def main(argv: Optional[list] = None):
             except Exception as e:
                 print(f"[viz] GT shell compute failed: {e!r}")
                 gt_pts = np.zeros((0, 3), np.float32)
+            # Optional goal markers (decoupled from sim init)
+            goal_pts = np.zeros((0, 3), np.float32)
+            try:
+                # Only show when goals preset is active OR explicit goal weight is given
+                goal_on = (args.preset == 'goals') or (args.goal_w is not None and float(args.goal_w) > 0.0)
+                if goal_on:
+                    N = int(states0.p.shape[0])
+                    z0 = float(jax.device_get(states0.p[0, 2]))
+                    # Prefer explicit --goal-radius if provided; else default 3.0 (same as preset)
+                    r = float(args.goal_radius) if args.goal_radius is not None else 3.0
+                    az = np.linspace(0.0, 2 * np.pi, N, endpoint=False)
+                    x = r * np.cos(az)
+                    y = r * np.sin(az)
+                    z = np.full((N,), z0, dtype=np.float32)
+                    goal_pts = np.stack([x, y, z], axis=-1).astype(np.float32)
+            except Exception as e:
+                print(f"[viz] goal points compute failed: {e!r}")
             try:
                 from .live_map import HASH_CFG
                 lb = np.asarray(HASH_CFG.lb, np.float32)
@@ -593,7 +610,7 @@ def main(argv: Optional[list] = None):
                 lb = np.array([-6.0, -6.0, 0.0], np.float32)
                 ub = np.array([+6.0, +6.0, 4.0], np.float32)
             try:
-                viz_q.put({"type": "init", "gt_points": gt_pts, "lb": lb, "ub": ub})
+                viz_q.put({"type": "init", "gt_points": gt_pts, "goal_points": goal_pts, "lb": lb, "ub": ub})
             except Exception as e:
                 print(f"[viz] send init failed: {e!r}")
 
