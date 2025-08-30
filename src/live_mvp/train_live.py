@@ -66,6 +66,19 @@ class SimCfg(NamedTuple):
     # --- NEW: explicit reward weight & exploration noise ---
     w_recon: float = 1.0         # scales reconstruction reward (higher → explore)
     act_noise: float = 0.0       # stddev of Gaussian action noise (0 disables)
+    # --- NEW (goals): simple position targets ---
+    goal_w: float = 0.0          # weight of goal reward (0 disables)
+    goal_sigma: float = 1.0      # meters; how wide the reward peak is
+    goal_radius: float = 3.0     # meters; where we place targets in a ring
+    skip_mapping: bool = False   # when True, skip all mapping/recon work
+
+def _make_goal_points(N: int, radius: float, z: float):
+    """Ring of N points at height z with given radius (world frame)."""
+    az = jnp.linspace(0.0, 2*jnp.pi, N, endpoint=False)
+    x = radius * jnp.cos(az)
+    y = radius * jnp.sin(az)
+    zc = jnp.full((N,), z)
+    return jnp.stack([x, y, zc], axis=-1)  # (N,3)
 
 
 def soft_collision_live(p, theta, margin):
@@ -76,6 +89,11 @@ def soft_collision_live(p, theta, margin):
 def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
     """One environment, N drones, train policy; update map online each step."""
     N = states0.p.shape[0]
+
+    # --- Goals: one target per drone on a ring at the drones' initial height ---
+    z0 = states0.p[0, 2]  # height to keep goals at same z as start
+    radius = jnp.asarray(sim.goal_radius, dtype=states0.p.dtype)
+    goals  = _make_goal_points(int(N), radius, z0)  # (N,3)
 
     def _sanitize_mapstate(ms: MapState, max_abs: float = 1e3) -> MapState:
         """Clip & de-NaN the map params (mirrors viewer's guard)."""
@@ -131,9 +149,12 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
                        "[dbg] t={:d} map_update: hits={} free={}", t, n_hit, n_free)
             return ms
 
-        mapstate = jax.lax.fori_loop(0, N, update_from_drone, mapstate)
-        # Keep map numerically healthy (same guard as viewer)
-        mapstate = _sanitize_mapstate(mapstate)
+        # Optional: skip mapping entirely when verifying the loop with goals
+        if (not sim.skip_mapping) and (sim.w_recon > 0.0):
+            mapstate = jax.lax.fori_loop(0, N, update_from_drone, mapstate)
+            mapstate = _sanitize_mapstate(mapstate)
+        else:
+            mapstate = mapstate  # pass-through
 
         # === 2) Policy obs: non-learned anchor-lattice + unseen compass + kinematics ===
         Rws = jax.vmap(R_from_q)(states.q)
@@ -188,18 +209,28 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
             w=jax.vmap(lambda st, u: step(st, u, sim.dyn).w)(states, u_raw),
         )
 
-        # === 4) Reward from LIVE map only ===
-        def drone_reward(i):
-            o = states_next.p[i]; q = states_next.q[i]
-            rays_w = body_rays_world(q, RAYS_BODY)
-            idx = jnp.arange(0, RAYS_BODY.shape[0], 4)
-            sel = rays_w[idx]
-            rws = jax.vmap(lambda d: recon_reward_for_ray(o, d, mapstate.geom.theta, mapstate.expo.eta, sim.rcfg))(sel)
-            _dbg_print(_dbg_mask_for_step(t),
-                       "[dbg] t={:d} drone {:d} recon[min,mean,max]=({:.3e},{:.3e},{:.3e})",
-                       t, i, jnp.nanmin(rws), jnp.nanmean(rws), jnp.nanmax(rws))
-            return rws.mean()
-        recon_rew = jax.vmap(drone_reward)(jnp.arange(N))
+        # === 4) Reward from LIVE map only (optional; can be disabled) ===
+        if sim.w_recon > 0.0:
+            def drone_reward(i):
+                o = states_next.p[i]; q = states_next.q[i]
+                rays_w = body_rays_world(q, RAYS_BODY)
+                idx = jnp.arange(0, RAYS_BODY.shape[0], 4)
+                sel = rays_w[idx]
+                rws = jax.vmap(lambda d: recon_reward_for_ray(o, d, mapstate.geom.theta, mapstate.expo.eta, sim.rcfg))(sel)
+                _dbg_print(_dbg_mask_for_step(t),
+                           "[dbg] t={:d} drone {:d} recon[min,mean,max]=({:.3e},{:.3e},{:.3e})",
+                           t, i, jnp.nanmin(rws), jnp.nanmean(rws), jnp.nanmax(rws))
+                return rws.mean()
+            recon_rew = jax.vmap(drone_reward)(jnp.arange(N))
+        else:
+            recon_rew = jnp.zeros((N,), dtype=jnp.float32)
+
+        # --- Goal reward: encourage p -> goals[i]
+        # Smooth, bounded reward: exp(-||p - g||^2 / (2*sigma^2))
+        diffs = states_next.p - goals            # (N,3)
+        dist2 = jnp.sum(diffs * diffs, axis=1)   # (N,)
+        sigma2 = (sim.goal_sigma * sim.goal_sigma) + 1e-9
+        goal_rew = jnp.exp(-dist2 / (2.0 * sigma2))  # (N,)
 
         # penalties
         coll = jax.vmap(lambda p: soft_collision_live(p, mapstate.geom.theta, sim.margin))(states_next.p)
@@ -212,7 +243,8 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
         coll_raw  = coll.mean()
         ctrl_raw  = ctrl.mean()
         # --- base loss
-        loss_raw  = sim.w_coll * coll_raw + sim.w_ctrl * ctrl_raw - sim.w_recon * recon_raw
+        loss_raw  = sim.w_coll * coll_raw + sim.w_ctrl * ctrl_raw \
+                    - sim.w_recon * recon_raw - sim.goal_w * goal_rew.mean()
         # --- debug: isolate the ctrl term to confirm gradient flow
         if bool(int(os.environ.get("LIVEMVP_DEBUG_CTRL_ONLY", "0"))):
             loss_raw = sim.w_ctrl * ctrl_raw
@@ -253,6 +285,9 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
             u_nan=u_nan,
             obs_nan=obs_nan,
             grad_probe=jnp.asarray(grad_probe_rms, jnp.float32),
+            # NEW goal metrics
+            goal=jnp.nan_to_num(goal_rew.mean(), nan=0.0, posinf=0.0, neginf=0.0),
+            goal_dist=jnp.nan_to_num(jnp.sqrt(dist2).mean(), nan=0.0, posinf=0.0, neginf=0.0),
         )
         return (key, states_next, mapstate), (loss_raw, metrics)
 
@@ -370,7 +405,7 @@ def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimC
 
 # JIT-compiled variant where ONLY shape-relevant bits are static.
 # This avoids recompiles when tweaking weights/presets.
-@partial(jax.jit, static_argnames=("steps", "samples"), donate_argnums=(0, 1, 2))
+@partial(jax.jit, static_argnames=("steps", "samples", "sim"), donate_argnums=(0, 1, 2))
 def _train_step_jit(policy_params, opt_state, mapstate, states0, key,
                     sim: SimCfg, steps: int, samples: int):
     sim = sim._replace(steps=int(steps), rcfg=sim.rcfg._replace(S=int(samples)))
@@ -413,7 +448,7 @@ def main(argv: Optional[list] = None):
     parser.add_argument("--csv", type=str, default="", help="Write per-iter metrics to CSV.")
     # ----- Presets -----
     parser.add_argument("--preset", type=str, default=None,
-                        choices=["safe", "coverage", "aggressive", "photometric", "debug-ctrl"],
+                        choices=["safe", "coverage", "aggressive", "photometric", "debug-ctrl", "goals"],
                         help="Load a preset of reward/shaping knobs (overridable by flags).")
     # ----- Objective weights / safety -----
     parser.add_argument("--w-coll", type=float, default=None, help="Collision penalty weight.")
@@ -432,6 +467,10 @@ def main(argv: Optional[list] = None):
     parser.add_argument("--samples", type=int, default=None, help="Samples per ray for recon reward.")
     parser.add_argument("--t0", type=float, default=None, help="Near bound for rays.")
     parser.add_argument("--t1", type=float, default=None, help="Far bound for rays.")
+    # ----- Goals (optional overrides) -----
+    parser.add_argument("--goal-w", type=float, default=None, help="Weight of the goal reward.")
+    parser.add_argument("--goal-sigma", type=float, default=None, help="Sigma (m) for exp(-d^2/(2 sigma^2)).")
+    parser.add_argument("--goal-radius", type=float, default=None, help="Ring radius (m) for per-drone targets.")
     args = parser.parse_args(argv)
 
     # Enable persistent compilation cache if available (no XLA flags needed).
@@ -489,6 +528,20 @@ def main(argv: Optional[list] = None):
         elif name == "debug-ctrl":
             rcfg = rcfg._replace(S=48)
             sim = sim._replace(w_recon=0.0, w_ctrl=0.01, w_coll=3.0, margin=0.12, act_noise=0.0)
+        elif name == "goals":
+            # Strip it down: no recon, no collision shaping; focus on reaching targets.
+            rcfg = rcfg._replace(S=32)  # smaller sampling; not used when recon is off
+            sim = sim._replace(
+                w_recon=0.0,
+                w_ctrl=5e-4,
+                w_coll=0.0,
+                margin=0.10,
+                act_noise=0.05,
+                goal_w=1.0,
+                goal_sigma=1.0,
+                goal_radius=3.0,
+                skip_mapping=True,
+            )
         return rcfg, sim
 
     # ----- Build RenderCfg and SimCfg -----
@@ -518,6 +571,10 @@ def main(argv: Optional[list] = None):
     if args.w_recon is not None:      sim = sim._replace(w_recon=float(args.w_recon))
     if args.margin is not None:       sim = sim._replace(margin=float(args.margin))
     if args.act_noise is not None:    sim = sim._replace(act_noise=float(args.act_noise))
+    # Goals overrides
+    if args.goal_w is not None:       sim = sim._replace(goal_w=float(args.goal_w))
+    if args.goal_sigma is not None:   sim = sim._replace(goal_sigma=float(args.goal_sigma))
+    if args.goal_radius is not None:  sim = sim._replace(goal_radius=float(args.goal_radius))
 
     # small banner so runs are self-describing
     print(f"[cfg] preset={args.preset or 'none'} | "
@@ -579,6 +636,8 @@ def main(argv: Optional[list] = None):
         loss_fin = float(metrics.get("loss_isfinite", 0.0))
         u_nan_f = float(metrics.get("u_nan", 0.0))
         obs_nan_f = float(metrics.get("obs_nan", 0.0))
+        goal_f = float(metrics.get("goal", 0.0))
+        gdist_f = float(metrics.get("goal_dist", 0.0))
         gprobe_f = float(metrics.get("grad_probe", 0.0))
         gleaf_f  = float(metrics.get("grad_leaf_ratio", 0.0))
         gfin_f   = float(metrics.get("grad_finite_frac", 1.0))
@@ -598,6 +657,7 @@ def main(argv: Optional[list] = None):
                 f"[{it:03d}] dt={dt*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
+                f"goal={goal_f:.3e} | goal_dist={gdist_f:.2f} | "
                 f"u_rms={urms_f:.3e} (u_nan={u_nan_f:.0f}) | obs_nan={obs_nan_f:.3f} | "
                 f"gprobe={gprobe_f:.3e} | grad_rms={grads_f:.3e} | grad_norm={gnorm:.3e} "
                 f"(pre={gnormpre:.3e}, finite={gfin_f:.2f}, gmax={gpremax:.2e}) | "
@@ -609,6 +669,7 @@ def main(argv: Optional[list] = None):
                 f"[{it:03d}] dt={dt*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
+                f"goal={goal_f:.3e} | goal_dist={gdist_f:.2f} | "
                 f"u_rms={urms_f:.3e} (u_nan={u_nan_f:.0f}) | obs_nan={obs_nan_f:.3f} | "
                 f"gprobe={gprobe_f:.3e} | grad_rms={grads_f:.3e} | grad_norm={gnorm:.3e} "
                 f"(pre={gnormpre:.3e}, finite={gfin_f:.2f}, gmax={gpremax:.2e}) | "
