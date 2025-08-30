@@ -7,6 +7,24 @@ from queue import Empty
 import numpy as np
 import pyvista as pv
 
+# --- Quaternion helpers (NumPy only; no JAX here) ---
+def quat_to_R_numpy(q: np.ndarray) -> np.ndarray:
+    """3x3 rotation matrix from quaternion [w,x,y,z]."""
+    w, x, y, z = [float(v) for v in q]
+    xx, yy, zz = x*x, y*y, z*z
+    wx, wy, wz = w*x, w*y, w*z
+    xy, xz, yz = x*y, x*z, y*z
+    return np.array([
+        [1 - 2*(yy+zz), 2*(xy - wz),   2*(xz + wy)],
+        [2*(xy + wz),   1 - 2*(xx+zz), 2*(yz - wx)],
+        [2*(xz - wy),   2*(yz + wx),   1 - 2*(xx+yy)],
+    ], dtype=np.float32)
+
+def quat_to_forward_numpy(q: np.ndarray) -> np.ndarray:
+    """Return body +X axis in world frame (camera forward)."""
+    R = quat_to_R_numpy(q)
+    return (R @ np.array([1.0, 0.0, 0.0], np.float32)).astype(np.float32)
+
 
 def make_point_cloud_polydata(pts: np.ndarray) -> pv.PolyData:
     poly = pv.PolyData()
@@ -89,6 +107,7 @@ class BasicTrainViewer:
         self.pb = Playback()
 
         self.hud_actor = None
+        self.arrow_actor = None  # camera/heading arrows overlay
 
         self.speed_slider = None
         self._add_speed_slider()
@@ -213,6 +232,48 @@ class BasicTrainViewer:
             self.ensure_drone_poly(p_now.shape[0])
         self.drone_poly.points = np.asarray(p_now, np.float32)
 
+    def _remove_arrow_actor(self):
+        """Safe remove for the arrows overlay."""
+        try:
+            if self.arrow_actor is not None:
+                self.pl.remove_actor(self.arrow_actor)
+        except Exception:
+            pass
+        self.arrow_actor = None
+
+    def update_arrows(self):
+        """
+        Overlay a cyan arrow per drone showing the camera forward direction.
+        Requires both p_seq and q_seq; no-ops (and hides) otherwise.
+        """
+        if self.pb.p_seq is None or self.pb.q_seq is None or self.pb.T == 0:
+            self._remove_arrow_actor()
+            return
+
+        idx = int(self.pb.idx)
+        p_now = np.asarray(self.pb.p_seq[idx], np.float32)   # (N,3)
+        q_now = np.asarray(self.pb.q_seq[idx], np.float32)   # (N,4)
+        N = p_now.shape[0]
+
+        fwd = np.zeros_like(p_now, dtype=np.float32)
+        for i in range(N):
+            try:
+                fwd[i] = quat_to_forward_numpy(q_now[i])
+            except Exception:
+                fwd[i] = np.array([1.0, 0.0, 0.0], np.float32)
+
+        # Normalize and scale arrows to a readable length
+        norms = np.linalg.norm(fwd, axis=1, keepdims=True) + 1e-9
+        fwd = (fwd / norms) * 0.8  # arrow length ~0.8m
+
+        # Recreate the arrows each frame for simplicity/robustness
+        self._remove_arrow_actor()
+        try:
+            self.arrow_actor = self.pl.add_arrows(p_now, fwd, mag=1.0, color="cyan")
+        except Exception:
+            # If arrows fail for any reason, ensure the overlay is off instead of crashing
+            self.arrow_actor = None
+
     def update_hud(self):
         try:
             if self.hud_actor is not None:
@@ -267,9 +328,11 @@ class BasicTrainViewer:
 
             if self.pb.step_if_due() and self.pb.p_seq is not None:
                 self.update_drones(self.pb.p_seq[self.pb.idx])
+                self.update_arrows()
 
             if (not self.pb.playing) and self.pb.p_seq is not None:
                 self.update_drones(self.pb.p_seq[self.pb.idx])
+                self.update_arrows()
 
             self.update_hud()
 

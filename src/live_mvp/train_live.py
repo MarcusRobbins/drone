@@ -83,6 +83,10 @@ class SimCfg(NamedTuple):
     z_min: float = 0.0           # lower soft barrier (set in main())
     z_max: float = 0.0           # upper soft barrier (set in main())
     z_tau: float = 0.10          # softness of altitude barrier
+    # --- NEW (mapping throttles): reduce mapping cost without changing behavior by default ---
+    map_update_every: int = 1    # update map every K timesteps (1 = every step)
+    map_ray_sub: int = 4         # stride for subsampling body rays (default 4)
+    map_free_samples: int = 24   # free-space samples per ray (default 24)
 
 def _make_goal_points(N: int, radius: float, z: float):
     """Ring of N points at height z with given radius (world frame)."""
@@ -107,6 +111,21 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
     radius = jnp.asarray(sim.goal_radius, dtype=states0.p.dtype)
     goals  = _make_goal_points(int(N), radius, z0)  # (N,3)
 
+    # Precompute collision warm-up schedule vector (length=steps), gated by iter_idx
+    tvec = jnp.arange(sim.steps, dtype=jnp.int32)
+    w_steps = jnp.asarray(sim.coll_warmup_steps, jnp.int32)
+    w_ramp  = jnp.asarray(sim.coll_warmup_ramp, jnp.int32)
+    off_v = (tvec < w_steps)
+    in_ramp_v = jnp.logical_and(tvec >= w_steps, tvec < (w_steps + w_ramp))
+    num_v = (tvec - w_steps + 1).astype(jnp.float32)
+    den_v = jnp.maximum(jnp.asarray(1, jnp.int32), w_ramp).astype(jnp.float32)
+    base_schedule = jnp.where(off_v, 0.0,
+                              jnp.where(in_ramp_v, jnp.clip(num_v / den_v, 0.0, 1.0), 1.0))
+    k_iters = jnp.asarray(sim.coll_warmup_iters, jnp.int32)
+    it_idx  = jnp.asarray(iter_idx, jnp.int32)
+    iter_active = jnp.logical_or(k_iters <= 0, it_idx < k_iters)
+    cws_schedule = jnp.where(iter_active, base_schedule, jnp.ones_like(base_schedule))
+
     def _sanitize_mapstate(ms: MapState, max_abs: float = 1e3) -> MapState:
         """Clip & de-NaN the map params (mirrors viewer's guard)."""
         def clean(x):
@@ -123,11 +142,11 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
         def update_from_drone(i, ms):
             p = states.p[i]; q = states.q[i]
             rays_w = body_rays_world(q, RAYS_BODY)
-            idx = jnp.arange(0, RAYS_BODY.shape[0], 4)           # subsample for speed
+            idx = jnp.arange(0, RAYS_BODY.shape[0], int(sim.map_ray_sub))
             sel = rays_w[idx]
 
             # Fixed sample positions along each ray; mask beyond measured depth
-            SFS = 24
+            SFS = int(sim.map_free_samples)
             ts = jnp.linspace(sim.rcfg.t0, sim.rcfg.t1, SFS)     # (SFS,)
 
             def per_ray(d):
@@ -163,8 +182,14 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
 
         # Optional: skip mapping entirely when verifying the loop with goals
         if (not sim.skip_mapping) and (sim.w_recon > 0.0):
-            mapstate = jax.lax.fori_loop(0, N, update_from_drone, mapstate)
-            mapstate = _sanitize_mapstate(mapstate)
+            do_map = ((t % int(sim.map_update_every)) == 0)
+            def _run_map(ms_in):
+                ms1 = jax.lax.fori_loop(0, N, update_from_drone, ms_in)
+                ms1 = _sanitize_mapstate(ms1)
+                return ms1
+            def _no_map(ms_in):
+                return ms_in
+            mapstate = jax.lax.cond(do_map, _run_map, _no_map, mapstate)
         else:
             mapstate = mapstate  # pass-through
 
@@ -226,7 +251,7 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
             def drone_reward(i):
                 o = states_next.p[i]; q = states_next.q[i]
                 rays_w = body_rays_world(q, RAYS_BODY)
-                idx = jnp.arange(0, RAYS_BODY.shape[0], 4)
+                idx = jnp.arange(0, RAYS_BODY.shape[0], int(sim.map_ray_sub))
                 sel = rays_w[idx]
                 rws = jax.vmap(lambda d: recon_reward_for_ray(o, d, mapstate.geom.theta, mapstate.expo.eta, sim.rcfg))(sel)
                 _dbg_print(_dbg_mask_for_step(t),
@@ -262,22 +287,9 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
         upper = jax.nn.softplus((z - jnp.asarray(sim.z_max, jnp.float32)) / (tau + 1e-9))
         alt_pen = (lower + upper).mean()
 
-        # --- Collision warm-up scale (per timestep t) ---
-        # Off period, then optional linear ramp to 1.0; optionally only for first K iters.
+        # --- Collision warm-up scale from precomputed schedule ---
         t_i = jnp.asarray(t, jnp.int32)
-        w_steps = jnp.asarray(sim.coll_warmup_steps, jnp.int32)
-        w_ramp  = jnp.asarray(sim.coll_warmup_ramp, jnp.int32)
-        off = (t_i < w_steps)
-        in_ramp = jnp.logical_and(t_i >= w_steps, t_i < (w_steps + w_ramp))
-        num = jnp.asarray(t_i - w_steps + 1, jnp.float32)  # +1 so first ramp step > 0
-        den = jnp.maximum(jnp.asarray(1, jnp.int32), w_ramp).astype(jnp.float32)
-        base_scale = jnp.where(off, 0.0,
-                               jnp.where(in_ramp, jnp.clip(num / den, 0.0, 1.0), 1.0))
-        # Iteration gate: when coll_warmup_iters <= 0, always active; else active for iter_idx < K
-        k_iters = jnp.asarray(sim.coll_warmup_iters, jnp.int32)
-        it_idx  = jnp.asarray(iter_idx, jnp.int32)
-        iter_active = jnp.logical_or(k_iters <= 0, it_idx < k_iters)
-        coll_w_scale = jnp.where(iter_active, base_scale, jnp.array(1.0, jnp.float32))
+        coll_w_scale = cws_schedule[t_i]
 
         # --- compute RAW loss (no sanitization) for gradient ---
         recon_raw = recon_rew.mean()
@@ -341,6 +353,8 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
             z_min_obs=jnp.nan_to_num(jnp.min(z), nan=0.0, posinf=0.0, neginf=0.0),
             z_mean_obs=jnp.nan_to_num(jnp.mean(z), nan=0.0, posinf=0.0, neginf=0.0),
             z_max_obs=jnp.nan_to_num(jnp.max(z), nan=0.0, posinf=0.0, neginf=0.0),
+            # NEW: mapping throttle visibility
+            map_update_ratio=(1.0 / jnp.maximum(1.0, jnp.asarray(sim.map_update_every, jnp.float32))),
         )
         return (key, states_next, mapstate), (loss_raw, metrics)
 
@@ -485,8 +499,9 @@ def train_step(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, it
     backend = jax.default_backend()
     use_jit = (backend in ("cuda", "rocm")) or (sim.steps >= 20)
     if use_jit:
+        iter_idx_jax = jnp.asarray(iter_idx, jnp.int32)
         return _train_step_jit(policy_params, opt_state, mapstate, states0, key,
-                               sim, int(sim.steps), int(sim.rcfg.S), int(iter_idx))
+                               sim, int(sim.steps), int(sim.rcfg.S), iter_idx_jax)
     else:
         return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim, int(iter_idx))
 
@@ -575,6 +590,13 @@ def main(argv: Optional[list] = None):
                         help="Ramp steps to linearly increase collision penalty from 0 to full (default: 0).")
     parser.add_argument("--coll-warmup-iters", type=int, default=0,
                         help="If >0, apply warm-up only for first K training iterations (default: 0 = every rollout).")
+    # ----- Mapping throttles -----
+    parser.add_argument("--map-update-every", type=int, default=1,
+                        help="Update the map every K sim steps (default: 1).")
+    parser.add_argument("--map-ray-sub", type=int, default=4,
+                        help="Subsample body rays by this stride during mapping (default: 4).")
+    parser.add_argument("--map-free-samples", type=int, default=24,
+                        help="Free-space samples per ray for exposure update (default: 24).")
     # ----- Presets -----
     parser.add_argument("--preset", type=str, default=None,
                         choices=["safe", "coverage", "aggressive", "photometric", "debug-ctrl", "goals"],
@@ -691,7 +713,6 @@ def main(argv: Optional[list] = None):
             except Exception as e:
                 print(f"[viz] goal points compute failed: {e!r}")
             try:
-                from .live_map import HASH_CFG
                 lb = np.asarray(HASH_CFG.lb, np.float32)
                 ub = np.asarray(HASH_CFG.ub, np.float32)
             except Exception:
@@ -777,6 +798,10 @@ def main(argv: Optional[list] = None):
     if args.coll_warmup_steps is not None: sim = sim._replace(coll_warmup_steps=int(args.coll_warmup_steps))
     if args.coll_warmup_ramp is not None:  sim = sim._replace(coll_warmup_ramp=int(args.coll_warmup_ramp))
     if args.coll_warmup_iters is not None: sim = sim._replace(coll_warmup_iters=int(args.coll_warmup_iters))
+    # Mapping throttle overrides (clamped)
+    if args.map_update_every is not None: sim = sim._replace(map_update_every=max(1, int(args.map_update_every)))
+    if args.map_ray_sub is not None:     sim = sim._replace(map_ray_sub=max(1, int(args.map_ray_sub)))
+    if args.map_free_samples is not None: sim = sim._replace(map_free_samples=max(2, int(args.map_free_samples)))
     # Stability shaping overrides
     if args.w_speed is not None:      sim = sim._replace(w_speed=float(args.w_speed))
     if args.w_alt is not None:        sim = sim._replace(w_alt=float(args.w_alt))
@@ -805,6 +830,7 @@ def main(argv: Optional[list] = None):
     print(f"[cfg] warmup: steps={sim.coll_warmup_steps} ramp={sim.coll_warmup_ramp} iters={sim.coll_warmup_iters}")
     print(f"[cfg] bias/kinematics: geom_bias={args.geom_bias:.2f} | w_speed={sim.w_speed} | "
           f"w_alt={sim.w_alt} z∈[{sim.z_min:.2f},{sim.z_max:.2f}] τz={sim.z_tau}")
+    print(f"[cfg] mapping: update_every={sim.map_update_every} ray_sub={sim.map_ray_sub} free_samples={sim.map_free_samples}")
 
     # Optional TensorBoard trace
     tracedir = args.profile.strip()
