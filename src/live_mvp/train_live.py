@@ -73,6 +73,10 @@ class SimCfg(NamedTuple):
     goal_sigma: float = 1.0      # meters; how wide the reward peak is
     goal_radius: float = 3.0     # meters; where we place targets in a ring
     skip_mapping: bool = False   # when True, skip all mapping/recon work
+    # --- NEW (collision warm-up): disable/ramp collision penalty early in rollout ---
+    coll_warmup_steps: int = 0   # steps with collision penalty fully off
+    coll_warmup_ramp: int = 0    # ramp length (linear 0->1) after off period
+    coll_warmup_iters: int = 0   # if >0, apply warm-up only for first K iters
 
 def _make_goal_points(N: int, radius: float, z: float):
     """Ring of N points at height z with given radius (world frame)."""
@@ -88,7 +92,7 @@ def soft_collision_live(p, theta, margin):
     return jax.nn.softplus(margin - G_phi(p, theta))
 
 
-def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
+def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_idx: int = 0):
     """One environment, N drones, train policy; update map online each step."""
     N = states0.p.shape[0]
 
@@ -240,12 +244,30 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
         # RMS magnitude of action per-iteration (diagnostic)
         u_rms = jnp.sqrt(jnp.maximum(ctrl.mean(), 0.0))
 
+        # --- Collision warm-up scale (per timestep t) ---
+        # Off period, then optional linear ramp to 1.0; optionally only for first K iters.
+        t_i = jnp.asarray(t, jnp.int32)
+        w_steps = jnp.asarray(sim.coll_warmup_steps, jnp.int32)
+        w_ramp  = jnp.asarray(sim.coll_warmup_ramp, jnp.int32)
+        off = (t_i < w_steps)
+        in_ramp = jnp.logical_and(t_i >= w_steps, t_i < (w_steps + w_ramp))
+        num = jnp.asarray(t_i - w_steps + 1, jnp.float32)  # +1 so first ramp step > 0
+        den = jnp.maximum(jnp.asarray(1, jnp.int32), w_ramp).astype(jnp.float32)
+        base_scale = jnp.where(off, 0.0,
+                               jnp.where(in_ramp, jnp.clip(num / den, 0.0, 1.0), 1.0))
+        # Iteration gate: when coll_warmup_iters <= 0, always active; else active for iter_idx < K
+        k_iters = jnp.asarray(sim.coll_warmup_iters, jnp.int32)
+        it_idx  = jnp.asarray(iter_idx, jnp.int32)
+        iter_active = jnp.logical_or(k_iters <= 0, it_idx < k_iters)
+        coll_w_scale = jnp.where(iter_active, base_scale, jnp.array(1.0, jnp.float32))
+
         # --- compute RAW loss (no sanitization) for gradient ---
         recon_raw = recon_rew.mean()
         coll_raw  = coll.mean()
         ctrl_raw  = ctrl.mean()
         # --- base loss
-        loss_raw  = sim.w_coll * coll_raw + sim.w_ctrl * ctrl_raw \
+        w_coll_eff = jnp.asarray(sim.w_coll, jnp.float32) * coll_w_scale
+        loss_raw  = w_coll_eff * coll_raw + sim.w_ctrl * ctrl_raw \
                     - sim.w_recon * recon_raw - sim.goal_w * goal_rew.mean()
         # --- debug: isolate the ctrl term to confirm gradient flow
         if bool(int(os.environ.get("LIVEMVP_DEBUG_CTRL_ONLY", "0"))):
@@ -290,6 +312,8 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg):
             # NEW goal metrics
             goal=jnp.nan_to_num(goal_rew.mean(), nan=0.0, posinf=0.0, neginf=0.0),
             goal_dist=jnp.nan_to_num(jnp.sqrt(dist2).mean(), nan=0.0, posinf=0.0, neginf=0.0),
+            # NEW: collision weight scale (for observability)
+            coll_w_scale=jnp.asarray(coll_w_scale, jnp.float32),
         )
         return (key, states_next, mapstate), (loss_raw, metrics)
 
@@ -334,9 +358,9 @@ def _frac_finite(tree):
     return jnp.mean(jnp.isfinite(vec).astype(jnp.float32))
 
 
-def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimCfg):
+def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, iter_idx: int = 0):
     def _loss_with_aux(pp):
-        loss, metrics, mapstate_out = _rollout_loss_impl(pp, mapstate, states0, key, sim)
+        loss, metrics, mapstate_out = _rollout_loss_impl(pp, mapstate, states0, key, sim, iter_idx)
         return loss, (metrics, mapstate_out)
 
     (loss, (metrics, mapstate_new)), grads = jax.value_and_grad(_loss_with_aux, has_aux=True)(policy_params)
@@ -409,9 +433,9 @@ def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimC
 # This avoids recompiles when tweaking weights/presets.
 @partial(jax.jit, static_argnames=("steps", "samples", "sim"), donate_argnums=(0, 1, 2))
 def _train_step_jit(policy_params, opt_state, mapstate, states0, key,
-                    sim: SimCfg, steps: int, samples: int):
+                    sim: SimCfg, steps: int, samples: int, iter_idx: int = 0):
     sim = sim._replace(steps=int(steps), rcfg=sim.rcfg._replace(S=int(samples)))
-    return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim)
+    return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim, iter_idx)
 
 
 def _pick_first_device():
@@ -426,7 +450,7 @@ def _pick_first_device():
     return jax.devices()[0]
 
 
-def train_step(policy_params, opt_state, mapstate, states0, key, sim: SimCfg):
+def train_step(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, iter_idx: int = 0):
     """
     Wrapper that runs JIT on GPU or larger runs, and plain eager on tiny CPU runs.
     This makes the smoke test fast and robust on CPU-only machines.
@@ -435,9 +459,9 @@ def train_step(policy_params, opt_state, mapstate, states0, key, sim: SimCfg):
     use_jit = (backend in ("cuda", "rocm")) or (sim.steps >= 20)
     if use_jit:
         return _train_step_jit(policy_params, opt_state, mapstate, states0, key,
-                               sim, int(sim.steps), int(sim.rcfg.S))
+                               sim, int(sim.steps), int(sim.rcfg.S), int(iter_idx))
     else:
-        return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim)
+        return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim, int(iter_idx))
 
 
 # ---------- Basic viewer helpers ----------
@@ -504,6 +528,13 @@ def main(argv: Optional[list] = None):
     parser.add_argument("--timing", action="store_true", help="Print timing each iteration and summary.")
     parser.add_argument("--profile", type=str, default="", help="Start TensorBoard trace to this directory.")
     parser.add_argument("--csv", type=str, default="", help="Write per-iter metrics to CSV.")
+    # ----- Collision warm-up (disable/ramp early collision penalty) -----
+    parser.add_argument("--coll-warmup-steps", type=int, default=0,
+                        help="Per-rollout steps with collision penalty disabled (default: 0).")
+    parser.add_argument("--coll-warmup-ramp", type=int, default=0,
+                        help="Ramp steps to linearly increase collision penalty from 0 to full (default: 0).")
+    parser.add_argument("--coll-warmup-iters", type=int, default=0,
+                        help="If >0, apply warm-up only for first K training iterations (default: 0 = every rollout).")
     # ----- Presets -----
     parser.add_argument("--preset", type=str, default=None,
                         choices=["safe", "coverage", "aggressive", "photometric", "debug-ctrl", "goals"],
@@ -685,6 +716,10 @@ def main(argv: Optional[list] = None):
     if args.w_recon is not None:      sim = sim._replace(w_recon=float(args.w_recon))
     if args.margin is not None:       sim = sim._replace(margin=float(args.margin))
     if args.act_noise is not None:    sim = sim._replace(act_noise=float(args.act_noise))
+    # Collision warm-up overrides
+    if args.coll_warmup_steps is not None: sim = sim._replace(coll_warmup_steps=int(args.coll_warmup_steps))
+    if args.coll_warmup_ramp is not None:  sim = sim._replace(coll_warmup_ramp=int(args.coll_warmup_ramp))
+    if args.coll_warmup_iters is not None: sim = sim._replace(coll_warmup_iters=int(args.coll_warmup_iters))
     # Goals overrides
     if args.goal_w is not None:       sim = sim._replace(goal_w=float(args.goal_w))
     if args.goal_sigma is not None:   sim = sim._replace(goal_sigma=float(args.goal_sigma))
@@ -697,6 +732,7 @@ def main(argv: Optional[list] = None):
     print(f"[cfg] R: t0={sim.rcfg.t0} t1={sim.rcfg.t1} S={sim.rcfg.S} eps={sim.rcfg.eps_shell}  "
           f"θ∈[{sim.rcfg.theta_min_deg},{sim.rcfg.theta_max_deg}] τθ={sim.rcfg.tau_theta}  "
           f"r0={sim.rcfg.r0} τr={sim.rcfg.tau_r}  γ_unseen={sim.rcfg.unseen_gamma}")
+    print(f"[cfg] warmup: steps={sim.coll_warmup_steps} ramp={sim.coll_warmup_ramp} iters={sim.coll_warmup_iters}")
 
     # Optional TensorBoard trace
     tracedir = args.profile.strip()
@@ -713,7 +749,7 @@ def main(argv: Optional[list] = None):
     print("Compiling (first train_step)…")
     key, sub = jax.random.split(key)
     (policy_params, opt_state, mapstate, loss, metrics), t_compile = time_blocked(
-        train_step, policy_params, opt_state, mapstate, states0, sub, sim
+        train_step, policy_params, opt_state, mapstate, states0, sub, sim, 0
     )
     print(f"[timing] compile+first: {t_compile:.3f}s  "
           f"(backend={jax.default_backend()}, device={dev})")
@@ -732,7 +768,7 @@ def main(argv: Optional[list] = None):
         key, sub = jax.random.split(key)
         iter_t0 = time.perf_counter()
         (policy_params, opt_state, mapstate, loss, metrics), dt = time_blocked(
-            train_step, policy_params, opt_state, mapstate, states0, sub, sim
+            train_step, policy_params, opt_state, mapstate, states0, sub, sim, it
         )
         wall = time.perf_counter() - iter_t0
         gap = wall - dt
@@ -767,10 +803,12 @@ def main(argv: Optional[list] = None):
 
         # When --timing is set, print EVERY iteration so cadence is visible
         if args.timing:
+            cws = float(metrics.get("coll_w_scale", 1.0))
             print(
                 f"[{it:03d}] dt={dt*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
+                f"coll_w_scale_mean={cws:.3f} | "
                 f"goal={goal_f:.3e} | goal_dist={gdist_f:.2f} | "
                 f"u_rms={urms_f:.3e} (u_nan={u_nan_f:.0f}) | obs_nan={obs_nan_f:.3f} | "
                 f"gprobe={gprobe_f:.3e} | grad_rms={grads_f:.3e} | grad_norm={gnorm:.3e} "
@@ -779,10 +817,12 @@ def main(argv: Optional[list] = None):
                 flush=True,
             )
         elif (it % 20 == 0) or (it == 1):
+            cws = float(metrics.get("coll_w_scale", 1.0))
             print(
                 f"[{it:03d}] dt={dt*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
+                f"coll_w_scale_mean={cws:.3f} | "
                 f"goal={goal_f:.3e} | goal_dist={gdist_f:.2f} | "
                 f"u_rms={urms_f:.3e} (u_nan={u_nan_f:.0f}) | obs_nan={obs_nan_f:.3f} | "
                 f"gprobe={gprobe_f:.3e} | grad_rms={grads_f:.3e} | grad_norm={gnorm:.3e} "
