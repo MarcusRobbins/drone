@@ -67,7 +67,7 @@ def init_hash_tables(key, cfg: HashCfg):
 # Tiny MLP
 # ---------------------------
 
-def init_mlp(key, in_dim, hidden, out_dim):
+def init_mlp(key, in_dim, hidden, out_dim, bias_last: float = 0.0):
     keys = jax.random.split(key, len(hidden)+1)
     params=[]
     prev = in_dim
@@ -76,7 +76,7 @@ def init_mlp(key, in_dim, hidden, out_dim):
         b = jnp.zeros((h,)); params.append((W,b)); prev=h
     k = keys[-1]
     W = jax.random.normal(k, (prev, out_dim)) * (1.0/jnp.sqrt(prev))
-    b = jnp.zeros((out_dim,)); params.append((W,b))
+    b = jnp.full((out_dim,), float(bias_last)); params.append((W,b))
     return tuple(params)
 
 def mlp_apply(params, x):
@@ -146,12 +146,12 @@ def _tree_stats(tree):
     maxabs = jnp.max(jnp.abs(v))
     return frac_bad, rms, maxabs
 
-def init_live_map(key):
+def init_live_map(key, geom_bias: float = 0.0):
     k1,k2,k3,k4 = jax.random.split(key, 4)
     tables_g = init_hash_tables(k1, HASH_CFG)
     tables_e = init_hash_tables(k2, HASH_CFG)
     in_dim   = HASH_CFG.L * HASH_CFG.F
-    mlp_g    = init_mlp(k3, in_dim, [64,64], 1)
+    mlp_g    = init_mlp(k3, in_dim, [64,64], 1, bias_last=float(geom_bias))
     mlp_e    = init_mlp(k4, in_dim, [64,64], 1)
     theta    = GeomParams(tables=tables_g, mlp=mlp_g)
     eta      = ExpoParams(tables=tables_e, mlp=mlp_e)

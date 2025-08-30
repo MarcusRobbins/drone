@@ -7,7 +7,7 @@ import multiprocessing as mp
 import numpy as np
 
 from .env_gt import raycast_depth_gt
-from .live_map import init_live_map, update_geom, update_expo, MapState, GeomState, ExpoState
+from .live_map import init_live_map, update_geom, update_expo, MapState, GeomState, ExpoState, HASH_CFG, G_phi
 from .render import RenderCfg, recon_reward_for_ray
 from .dyn import State, DynCfg, step, body_rays_world, R_from_q
 from .policy import init_mlp, mlp_apply, anchor_features, ANCHOR_FEAT_DIM
@@ -77,6 +77,12 @@ class SimCfg(NamedTuple):
     coll_warmup_steps: int = 0   # steps with collision penalty fully off
     coll_warmup_ramp: int = 0    # ramp length (linear 0->1) after off period
     coll_warmup_iters: int = 0   # if >0, apply warm-up only for first K iters
+    # --- NEW (stability shaping): velocity and altitude barriers ---
+    w_speed: float = 0.0         # weight for mean squared linear speed
+    w_alt: float = 0.0           # weight for altitude soft barrier
+    z_min: float = 0.0           # lower soft barrier (set in main())
+    z_max: float = 0.0           # upper soft barrier (set in main())
+    z_tau: float = 0.10          # softness of altitude barrier
 
 def _make_goal_points(N: int, radius: float, z: float):
     """Ring of N points at height z with given radius (world frame)."""
@@ -244,6 +250,18 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
         # RMS magnitude of action per-iteration (diagnostic)
         u_rms = jnp.sqrt(jnp.maximum(ctrl.mean(), 0.0))
 
+        # Velocity penalty (||v||^2 per drone)
+        v2 = jnp.sum(states_next.v * states_next.v, axis=1)
+        v_pen_mean = v2.mean()
+        speed_rms = jnp.sqrt(jnp.maximum(v_pen_mean, 0.0))
+
+        # Altitude soft barrier using softplus
+        z = states_next.p[:, 2]
+        tau = jnp.asarray(sim.z_tau, jnp.float32)
+        lower = jax.nn.softplus((jnp.asarray(sim.z_min, jnp.float32) - z) / (tau + 1e-9))
+        upper = jax.nn.softplus((z - jnp.asarray(sim.z_max, jnp.float32)) / (tau + 1e-9))
+        alt_pen = (lower + upper).mean()
+
         # --- Collision warm-up scale (per timestep t) ---
         # Off period, then optional linear ramp to 1.0; optionally only for first K iters.
         t_i = jnp.asarray(t, jnp.int32)
@@ -268,6 +286,8 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
         # --- base loss
         w_coll_eff = jnp.asarray(sim.w_coll, jnp.float32) * coll_w_scale
         loss_raw  = w_coll_eff * coll_raw + sim.w_ctrl * ctrl_raw \
+                    + jnp.asarray(sim.w_speed, jnp.float32) * v_pen_mean \
+                    + jnp.asarray(sim.w_alt, jnp.float32) * alt_pen \
                     - sim.w_recon * recon_raw - sim.goal_w * goal_rew.mean()
         # --- debug: isolate the ctrl term to confirm gradient flow
         if bool(int(os.environ.get("LIVEMVP_DEBUG_CTRL_ONLY", "0"))):
@@ -314,6 +334,13 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
             goal_dist=jnp.nan_to_num(jnp.sqrt(dist2).mean(), nan=0.0, posinf=0.0, neginf=0.0),
             # NEW: collision weight scale (for observability)
             coll_w_scale=jnp.asarray(coll_w_scale, jnp.float32),
+            # NEW: speed/altitude shaping telemetry
+            speed_rms=jnp.nan_to_num(speed_rms, nan=0.0, posinf=0.0, neginf=0.0),
+            v_pen=jnp.nan_to_num(v_pen_mean, nan=0.0, posinf=0.0, neginf=0.0),
+            alt_pen=jnp.nan_to_num(alt_pen, nan=0.0, posinf=0.0, neginf=0.0),
+            z_min_obs=jnp.nan_to_num(jnp.min(z), nan=0.0, posinf=0.0, neginf=0.0),
+            z_mean_obs=jnp.nan_to_num(jnp.mean(z), nan=0.0, posinf=0.0, neginf=0.0),
+            z_max_obs=jnp.nan_to_num(jnp.max(z), nan=0.0, posinf=0.0, neginf=0.0),
         )
         return (key, states_next, mapstate), (loss_raw, metrics)
 
@@ -528,6 +555,19 @@ def main(argv: Optional[list] = None):
     parser.add_argument("--timing", action="store_true", help="Print timing each iteration and summary.")
     parser.add_argument("--profile", type=str, default="", help="Start TensorBoard trace to this directory.")
     parser.add_argument("--csv", type=str, default="", help="Write per-iter metrics to CSV.")
+    # ----- Stability shaping: map bias, speed, altitude -----
+    parser.add_argument("--geom-bias", type=float, default=0.0,
+                        help="Initial bias for geometry SDF head final layer (default: 0.0)")
+    parser.add_argument("--w-speed", type=float, default=0.0,
+                        help="Weight for mean squared linear speed penalty (default: 0.0)")
+    parser.add_argument("--w-alt", type=float, default=0.0,
+                        help="Weight for altitude soft barrier (default: 0.0)")
+    parser.add_argument("--z-min", type=float, default=None,
+                        help="Lower altitude target; default from AABB lb[2]+0.05")
+    parser.add_argument("--z-max", type=float, default=None,
+                        help="Upper altitude target; default from AABB ub[2]-0.20")
+    parser.add_argument("--z-barrier-tau", type=float, default=0.10,
+                        help="Softness for altitude barrier (default: 0.10)")
     # ----- Collision warm-up (disable/ramp early collision penalty) -----
     parser.add_argument("--coll-warmup-steps", type=int, default=0,
                         help="Per-rollout steps with collision penalty disabled (default: 0).")
@@ -577,7 +617,24 @@ def main(argv: Optional[list] = None):
     dev = _pick_first_device()
     with jax.default_device(dev):
         key = jax.random.PRNGKey(0)
-        mapstate = init_live_map(key)
+        mapstate = init_live_map(key, geom_bias=float(args.geom_bias))
+
+        # Optional: one-time φ̂ stats after map init for observability
+        try:
+            lb = jax.device_get(HASH_CFG.lb)
+            ub = jax.device_get(HASH_CFG.ub)
+            xs = jnp.linspace(lb[0], ub[0], 10)
+            ys = jnp.linspace(lb[1], ub[1], 10)
+            zs = jnp.linspace(lb[2], ub[2], 5)
+            X, Y, Z = jnp.meshgrid(xs, ys, zs, indexing='xy')
+            P = jnp.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+            phi_vals = jax.vmap(lambda p: G_phi(p, mapstate.geom.theta))(P)
+            print("[init] geom phi stats:",
+                  f"mean={float(jnp.mean(phi_vals)):.3e}",
+                  f"min={float(jnp.min(phi_vals)):.3e}",
+                  f"max={float(jnp.max(phi_vals)):.3e}")
+        except Exception as e:
+            print(f"[init] geom phi stats failed: {e!r}")
 
         # N drones (shared map)
         N = int(max(1, args.drones))
@@ -720,6 +777,19 @@ def main(argv: Optional[list] = None):
     if args.coll_warmup_steps is not None: sim = sim._replace(coll_warmup_steps=int(args.coll_warmup_steps))
     if args.coll_warmup_ramp is not None:  sim = sim._replace(coll_warmup_ramp=int(args.coll_warmup_ramp))
     if args.coll_warmup_iters is not None: sim = sim._replace(coll_warmup_iters=int(args.coll_warmup_iters))
+    # Stability shaping overrides
+    if args.w_speed is not None:      sim = sim._replace(w_speed=float(args.w_speed))
+    if args.w_alt is not None:        sim = sim._replace(w_alt=float(args.w_alt))
+    if args.z_barrier_tau is not None: sim = sim._replace(z_tau=float(args.z_barrier_tau))
+    # Derive z_min/z_max defaults if not explicitly provided
+    zmin_def = float(jax.device_get(HASH_CFG.lb)[2]) + 0.05
+    zmax_def = float(jax.device_get(HASH_CFG.ub)[2]) - 0.20
+    zmin = float(args.z_min) if args.z_min is not None else zmin_def
+    zmax = float(args.z_max) if args.z_max is not None else zmax_def
+    if zmin >= zmax:
+        print(f"[warn] z_min >= z_max ({zmin:.3f} >= {zmax:.3f}); falling back to defaults from AABB.")
+        zmin, zmax = zmin_def, zmax_def
+    sim = sim._replace(z_min=zmin, z_max=zmax)
     # Goals overrides
     if args.goal_w is not None:       sim = sim._replace(goal_w=float(args.goal_w))
     if args.goal_sigma is not None:   sim = sim._replace(goal_sigma=float(args.goal_sigma))
@@ -733,6 +803,8 @@ def main(argv: Optional[list] = None):
           f"θ∈[{sim.rcfg.theta_min_deg},{sim.rcfg.theta_max_deg}] τθ={sim.rcfg.tau_theta}  "
           f"r0={sim.rcfg.r0} τr={sim.rcfg.tau_r}  γ_unseen={sim.rcfg.unseen_gamma}")
     print(f"[cfg] warmup: steps={sim.coll_warmup_steps} ramp={sim.coll_warmup_ramp} iters={sim.coll_warmup_iters}")
+    print(f"[cfg] bias/kinematics: geom_bias={args.geom_bias:.2f} | w_speed={sim.w_speed} | "
+          f"w_alt={sim.w_alt} z∈[{sim.z_min:.2f},{sim.z_max:.2f}] τz={sim.z_tau}")
 
     # Optional TensorBoard trace
     tracedir = args.profile.strip()
@@ -759,7 +831,7 @@ def main(argv: Optional[list] = None):
     csv_fh = None
     if csv_path:
         csv_fh = open(csv_path, "w", buffering=1)
-        csv_fh.write("iter,dt_ms,wall_ms,gap_ms,env_steps_s,drone_steps_s,loss,recon,coll,ctrl,u_rms,grad_rms,param_rms,update_rms\n")
+        csv_fh.write("iter,dt_ms,wall_ms,gap_ms,env_steps_s,drone_steps_s,loss,recon,coll,ctrl,u_rms,grad_rms,param_rms,update_rms,speed_rms,alt_pen\n")
 
     # Training loop (host logs tiny scalars)
     perstep = StepTimes("train_step")
@@ -804,11 +876,13 @@ def main(argv: Optional[list] = None):
         # When --timing is set, print EVERY iteration so cadence is visible
         if args.timing:
             cws = float(metrics.get("coll_w_scale", 1.0))
+            spd = float(metrics.get("speed_rms", 0.0))
+            altp = float(metrics.get("alt_pen", 0.0))
             print(
                 f"[{it:03d}] dt={dt*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
-                f"coll_w_scale_mean={cws:.3f} | "
+                f"coll_w_scale_mean={cws:.3f} | speed_rms={spd:.3e} | alt_pen={altp:.3e} | "
                 f"goal={goal_f:.3e} | goal_dist={gdist_f:.2f} | "
                 f"u_rms={urms_f:.3e} (u_nan={u_nan_f:.0f}) | obs_nan={obs_nan_f:.3f} | "
                 f"gprobe={gprobe_f:.3e} | grad_rms={grads_f:.3e} | grad_norm={gnorm:.3e} "
@@ -818,11 +892,13 @@ def main(argv: Optional[list] = None):
             )
         elif (it % 20 == 0) or (it == 1):
             cws = float(metrics.get("coll_w_scale", 1.0))
+            spd = float(metrics.get("speed_rms", 0.0))
+            altp = float(metrics.get("alt_pen", 0.0))
             print(
                 f"[{it:03d}] dt={dt*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
-                f"coll_w_scale_mean={cws:.3f} | "
+                f"coll_w_scale_mean={cws:.3f} | speed_rms={spd:.3e} | alt_pen={altp:.3e} | "
                 f"goal={goal_f:.3e} | goal_dist={gdist_f:.2f} | "
                 f"u_rms={urms_f:.3e} (u_nan={u_nan_f:.0f}) | obs_nan={obs_nan_f:.3f} | "
                 f"gprobe={gprobe_f:.3e} | grad_rms={grads_f:.3e} | grad_norm={gnorm:.3e} "
@@ -855,10 +931,13 @@ def main(argv: Optional[list] = None):
                 print(f"[viz] snapshot failed at iter {it}: {e!r}")
 
         if csv_fh:
+            spd = float(metrics.get("speed_rms", 0.0))
+            altp = float(metrics.get("alt_pen", 0.0))
             csv_fh.write(
                 f"{it},{dt*1e3:.3f},{wall*1e3:.3f},{gap*1e3:.3f},"
                 f"{env_steps:.3f},{drone_steps:.3f},"
-                f"{loss_f:.6e},{recon_f:.6e},{coll_f:.6e},{ctrl_f:.6e},{urms_f:.6e},{grads_f:.6e},{prms_f:.6e},{up_f:.6e}\n"
+                f"{loss_f:.6e},{recon_f:.6e},{coll_f:.6e},{ctrl_f:.6e},{urms_f:.6e},{grads_f:.6e},{prms_f:.6e},{up_f:.6e},"
+                f"{spd:.6e},{altp:.6e}\n"
             )
 
     # Timing summary (exclude the compile+first time from steady-state stats)
