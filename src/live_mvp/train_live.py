@@ -7,6 +7,7 @@ import multiprocessing as mp
 import numpy as np
 
 from .env_gt import raycast_depth_gt
+from .env_gt import build_gt_grid, raycast_depth_grid as raycast_depth_grid_cached
 from .live_map import init_live_map, update_geom, update_expo, MapState, GeomState, ExpoState, HASH_CFG, G_phi
 from .render import RenderCfg, recon_reward_for_ray
 from .dyn import State, DynCfg, step, body_rays_world, R_from_q
@@ -102,7 +103,7 @@ def soft_collision_live(p, theta, margin):
     return jax.nn.softplus(margin - G_phi(p, theta))
 
 
-def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_idx: int = 0):
+def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_idx: int = 0, gt_grid=None):
     """One environment, N drones, train policy; update map online each step."""
     N = states0.p.shape[0]
 
@@ -153,7 +154,13 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
                 # --- CUT GRADIENTS through GT sensing & sampling geometry ---
                 p_sg = jax.lax.stop_gradient(p)
                 d_sg = jax.lax.stop_gradient(d)
-                t = raycast_depth_gt(p_sg, d_sg)                  # full-scene GT depth (no-grad)
+                # Use fast cached grid when provided; otherwise analytic fallback.
+                if gt_grid is not None:
+                    t = raycast_depth_grid_cached(
+                        p_sg, d_sg, gt_grid, t_max=sim.rcfg.t1, eps=0.01, iters=48
+                    )
+                else:
+                    t = raycast_depth_gt(p_sg, d_sg)
                 stop_t = jnp.where(jnp.isnan(t), sim.rcfg.t1, t)
                 xs = p_sg[None, :] + ts[:, None] * d_sg[None, :]  # (SFS,3) (no-grad)
                 # free-space strictly before the hit
@@ -400,9 +407,9 @@ def _frac_finite(tree):
     return jnp.mean(jnp.isfinite(vec).astype(jnp.float32))
 
 
-def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, iter_idx: int = 0):
+def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, iter_idx: int = 0, gt_grid=None):
     def _loss_with_aux(pp):
-        loss, metrics, mapstate_out = _rollout_loss_impl(pp, mapstate, states0, key, sim, iter_idx)
+        loss, metrics, mapstate_out = _rollout_loss_impl(pp, mapstate, states0, key, sim, iter_idx, gt_grid)
         return loss, (metrics, mapstate_out)
 
     (loss, (metrics, mapstate_new)), grads = jax.value_and_grad(_loss_with_aux, has_aux=True)(policy_params)
@@ -475,9 +482,9 @@ def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimC
 # This avoids recompiles when tweaking weights/presets.
 @partial(jax.jit, static_argnames=("steps", "samples", "sim"), donate_argnums=(0, 1, 2))
 def _train_step_jit(policy_params, opt_state, mapstate, states0, key,
-                    sim: SimCfg, steps: int, samples: int, iter_idx: int = 0):
+                    sim: SimCfg, steps: int, samples: int, iter_idx: int = 0, gt_grid=None):
     sim = sim._replace(steps=int(steps), rcfg=sim.rcfg._replace(S=int(samples)))
-    return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim, iter_idx)
+    return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim, iter_idx, gt_grid)
 
 
 def _pick_first_device():
@@ -492,7 +499,7 @@ def _pick_first_device():
     return jax.devices()[0]
 
 
-def train_step(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, iter_idx: int = 0):
+def train_step(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, iter_idx: int = 0, gt_grid=None):
     """
     Wrapper that runs JIT on GPU or larger runs, and plain eager on tiny CPU runs.
     This makes the smoke test fast and robust on CPU-only machines.
@@ -502,9 +509,9 @@ def train_step(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, it
     if use_jit:
         iter_idx_jax = jnp.asarray(iter_idx, jnp.int32)
         return _train_step_jit(policy_params, opt_state, mapstate, states0, key,
-                               sim, int(sim.steps), int(sim.rcfg.S), iter_idx_jax)
+                               sim, int(sim.steps), int(sim.rcfg.S), iter_idx_jax, gt_grid)
     else:
-        return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim, int(iter_idx))
+        return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim, int(iter_idx), gt_grid)
 
 
 # ---------- Basic viewer helpers ----------
@@ -669,6 +676,14 @@ def main(argv: Optional[list] = None):
                   f"max={float(jnp.max(phi_vals)):.3e}")
         except Exception as e:
             print(f"[init] geom phi stats failed: {e!r}")
+        # Precompute GT grid once (device resident) and pass as an argument to jit
+        try:
+            lb = jax.device_get(HASH_CFG.lb); ub = jax.device_get(HASH_CFG.ub)
+            gt_grid = build_gt_grid(lb, ub, res_xyz=(160, 160, 80), use_numpy=True)
+            print("[init] Using cached GT grid raycaster (160x160x80)")
+        except Exception as e:
+            gt_grid = None
+            print(f"[init] Falling back to analytic GT raycast: {e!r}")
 
         # N drones (shared map)
         N = int(max(1, args.drones))
@@ -893,7 +908,7 @@ def main(argv: Optional[list] = None):
     print("Compiling (first train_step)…")
     key, sub = jax.random.split(key)
     (policy_params, opt_state, mapstate, loss, metrics), t_compile = time_blocked(
-        train_step, policy_params, opt_state, mapstate, states0, sub, sim, 0
+        train_step, policy_params, opt_state, mapstate, states0, sub, sim, 0, gt_grid
     )
     print(f"[timing] compile+first: {t_compile:.3f}s  "
           f"(backend={jax.default_backend()}, device={dev})")
@@ -912,7 +927,7 @@ def main(argv: Optional[list] = None):
         key, sub = jax.random.split(key)
         iter_t0 = time.perf_counter()
         (policy_params, opt_state, mapstate, loss, metrics), dt = time_blocked(
-            train_step, policy_params, opt_state, mapstate, states0, sub, sim, it
+            train_step, policy_params, opt_state, mapstate, states0, sub, sim, it, gt_grid
         )
         wall = time.perf_counter() - iter_t0
         gap = wall - dt
