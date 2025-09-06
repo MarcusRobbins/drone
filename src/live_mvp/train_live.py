@@ -382,7 +382,7 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
     loss = jnp.nan_to_num(losses.mean(), nan=0.0, posinf=0.0, neginf=0.0)
     # metrics_seq is a pytree dict of arrays with leading time dimension
     metrics = {k: jnp.nan_to_num(v.mean(), nan=0.0, posinf=0.0, neginf=0.0) for k, v in metrics_seq.items()}
-    return loss, metrics, carry_f[2]  # updated mapstate
+    return loss, metrics, carry_f[2], carry_f[1]  # updated mapstate, final states
 
 
 # -------------
@@ -420,10 +420,10 @@ def _frac_finite(tree):
 
 def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, iter_idx: int = 0, gt_grid=None):
     def _loss_with_aux(pp):
-        loss, metrics, mapstate_out = _rollout_loss_impl(pp, mapstate, states0, key, sim, iter_idx, gt_grid)
-        return loss, (metrics, mapstate_out)
+        loss, metrics, mapstate_out, states_final = _rollout_loss_impl(pp, mapstate, states0, key, sim, iter_idx, gt_grid)
+        return loss, (metrics, mapstate_out, states_final)
 
-    (loss, (metrics, mapstate_new)), grads = jax.value_and_grad(_loss_with_aux, has_aux=True)(policy_params)
+    (loss, (metrics, mapstate_new, _states_final)), grads = jax.value_and_grad(_loss_with_aux, has_aux=True)(policy_params)
 
     # ---- pre-sanitization gradient stats (detect pruned/NaN/flat) ----
     def _grad_tree_stats(g):
@@ -489,6 +489,74 @@ def _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim: SimC
     return policy_params, opt_state, mapstate_new, loss, metrics
 
 
+def _train_step_impl_with_state(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, iter_idx: int = 0, gt_grid=None):
+    """Same as _train_step_impl, but also returns the final states to allow chaining blocks."""
+    def _loss_with_aux(pp):
+        loss, metrics, mapstate_out, states_final = _rollout_loss_impl(pp, mapstate, states0, key, sim, iter_idx, gt_grid)
+        return loss, (metrics, mapstate_out, states_final)
+
+    (loss, (metrics, mapstate_new, states_final)), grads = jax.value_and_grad(_loss_with_aux, has_aux=True)(policy_params)
+
+    # Pre/post grad stats and update identical to _train_step_impl
+    def _grad_tree_stats(g):
+        leaves, _ = jtu.tree_flatten(g)
+        n_param = len(jtu.tree_leaves(policy_params))
+        n_grad = len(leaves)
+        leaf_ratio = 0.0 if n_param == 0 else (n_grad / float(n_param))
+        if n_grad == 0:
+            return (jnp.array(leaf_ratio, jnp.float32),
+                    jnp.array(0.0, jnp.float32),
+                    jnp.array(0.0, jnp.float32),
+                    jnp.array(0.0, jnp.float32))
+        total = 0
+        finite_total = 0
+        sqsum = 0.0
+        maxabs = 0.0
+        for x in leaves:
+            x = jnp.asarray(x)
+            total += x.size
+            finite = jnp.isfinite(x)
+            finite_total += finite.sum()
+            xx = jnp.where(finite, x, 0.0)
+            sqsum = sqsum + jnp.sum(xx * xx)
+            maxabs = jnp.maximum(maxabs, jnp.max(jnp.abs(xx)))
+        total_f = float(total)
+        finite_frac = (finite_total / total_f)
+        pre_rms = jnp.sqrt(sqsum / total_f)
+        return (jnp.array(leaf_ratio, jnp.float32),
+                jnp.array(finite_frac, jnp.float32),
+                jnp.array(maxabs, jnp.float32),
+                jnp.array(pre_rms, jnp.float32))
+    gleaf_ratio, gfinite_frac, gmaxabs, gpre_rms = _grad_tree_stats(grads)
+
+    grad_norm_pre = optax.global_norm(grads)
+    grads = jax.tree.map(lambda g: jnp.clip(jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), -1e3, 1e3), grads)
+    grad_norm = optax.global_norm(grads)
+
+    updates, opt_state = POLICY_OPT.update(grads, opt_state, policy_params)
+    policy_params = optax.apply_updates(policy_params, updates)
+    grad_rms = _tree_rms(grads)
+    param_rms = _tree_rms(policy_params)
+    update_rms = _tree_rms(updates)
+    update_norm = optax.global_norm(updates)
+    update_max = _tree_maxabs(updates)
+    metrics = dict(
+        metrics,
+        grad_rms=jnp.nan_to_num(grad_rms, nan=0.0, posinf=0.0, neginf=0.0),
+        param_rms=jnp.nan_to_num(param_rms, nan=0.0, posinf=0.0, neginf=0.0),
+        update_rms=jnp.nan_to_num(update_rms, nan=0.0, posinf=0.0, neginf=0.0),
+        grad_leaf_ratio=gleaf_ratio,
+        grad_finite_frac=gfinite_frac,
+        grad_pre_maxabs=gmaxabs,
+        grad_pre_rms=gpre_rms,
+        grad_norm=jnp.nan_to_num(grad_norm, nan=0.0, posinf=0.0, neginf=0.0),
+        grad_norm_pre=jnp.nan_to_num(grad_norm_pre, nan=0.0, posinf=0.0, neginf=0.0),
+        update_norm=jnp.nan_to_num(update_norm, nan=0.0, posinf=0.0, neginf=0.0),
+        update_max=jnp.nan_to_num(update_max, nan=0.0, posinf=0.0, neginf=0.0),
+    )
+    return policy_params, opt_state, mapstate_new, loss, metrics, states_final
+
+
 # JIT-compiled variant where ONLY shape-relevant bits are static.
 # This avoids recompiles when tweaking weights/presets.
 @partial(jax.jit, static_argnames=("steps", "samples", "sim"), donate_argnums=(0, 1, 2))
@@ -496,6 +564,13 @@ def _train_step_jit(policy_params, opt_state, mapstate, states0, key,
                     sim: SimCfg, steps: int, samples: int, iter_idx: int = 0, gt_grid=None):
     sim = sim._replace(steps=int(steps), rcfg=sim.rcfg._replace(S=int(samples)))
     return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim, iter_idx, gt_grid)
+
+
+@partial(jax.jit, static_argnames=("steps", "samples", "sim"), donate_argnums=(0, 1, 2))
+def _train_step_jit_with_state(policy_params, opt_state, mapstate, states0, key,
+                    sim: SimCfg, steps: int, samples: int, iter_idx: int = 0, gt_grid=None):
+    sim = sim._replace(steps=int(steps), rcfg=sim.rcfg._replace(S=int(samples)))
+    return _train_step_impl_with_state(policy_params, opt_state, mapstate, states0, key, sim, iter_idx, gt_grid)
 
 
 def _pick_first_device():
@@ -525,6 +600,18 @@ def train_step(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, it
         return _train_step_impl(policy_params, opt_state, mapstate, states0, key, sim, int(iter_idx), gt_grid)
 
 
+def train_step_with_state(policy_params, opt_state, mapstate, states0, key, sim: SimCfg, iter_idx: int = 0, gt_grid=None):
+    """Like train_step, but also returns the final states for chaining within an iteration."""
+    backend = jax.default_backend()
+    use_jit = (backend in ("cuda", "rocm")) or (sim.steps >= 20)
+    if use_jit:
+        iter_idx_jax = jnp.asarray(iter_idx, jnp.int32)
+        return _train_step_jit_with_state(policy_params, opt_state, mapstate, states0, key,
+                               sim, int(sim.steps), int(sim.rcfg.S), iter_idx_jax, gt_grid)
+    else:
+        return _train_step_impl_with_state(policy_params, opt_state, mapstate, states0, key, sim, int(iter_idx), gt_grid)
+
+
 # ---------- Basic viewer helpers ----------
 def _gt_shell_points(eps=0.08, res=(80, 80, 40)):
     """Return (M,3) GT shell points |phi_gt|<=eps on a regular grid."""
@@ -544,6 +631,38 @@ def _gt_shell_points(eps=0.08, res=(80, 80, 40)):
     pts_np = np.asarray(jax.device_get(pts))
     m_np = np.asarray(jax.device_get(mask))
     return pts_np[m_np].astype(np.float32)
+
+
+def _sample_initial_states(key, N: int, sim: SimCfg):
+    """Sample fresh initial drone states uniformly within the AABB with safe z-band.
+
+    Positions and yaw are randomized; if a spawn is inside geometry (phi<0),
+    we gently bump z upward to ensure positivity.
+    """
+    from .env_gt import phi_gt
+    from .live_map import HASH_CFG
+    kx, ky, kz, kyaw = jax.random.split(key, 4)
+    lo, hi = HASH_CFG.lb, HASH_CFG.ub
+
+    px = jax.random.uniform(kx, (N,), minval=lo[0] + 0.4, maxval=hi[0] - 0.4)
+    py = jax.random.uniform(ky, (N,), minval=lo[1] + 0.4, maxval=hi[1] - 0.4)
+    # stay in a safe vertical band implied by training barriers
+    zmin = jnp.asarray(sim.z_min, jnp.float32) + 0.10
+    zmax = jnp.asarray(sim.z_max, jnp.float32) - 0.10
+    pz = jax.random.uniform(kz, (N,), minval=zmin, maxval=zmax)
+
+    yaw = jax.random.uniform(kyaw, (N,), minval=-jnp.pi, maxval=jnp.pi)
+    q = jnp.stack([jnp.cos(0.5 * yaw), jnp.zeros((N,)), jnp.zeros((N,)), jnp.sin(0.5 * yaw)], axis=1)
+
+    p = jnp.stack([px, py, pz], axis=1)
+    v = jnp.zeros((N, 3)); w = jnp.zeros((N, 3))
+
+    # Light safety bump if we accidentally spawn in collision (phi<0)
+    phi = jax.vmap(phi_gt)(p)
+    bump = jnp.maximum(0.12 - phi, 0.0)  # lift by up to 12 cm to get phi>0
+    p = p.at[:, 2].add(bump)
+
+    return State(p, v, q, w)
 
 
 @partial(jax.jit, static_argnames=("steps",))
@@ -585,6 +704,11 @@ def main(argv: Optional[list] = None):
     parser = argparse.ArgumentParser(description="Train live_mvp policy with timing.")
     parser.add_argument("--drones", type=int, default=2, help="Number of drones N.")
     parser.add_argument("--steps", type=int, default=80, help="Sim steps per train_step.")
+    # Number of sim steps per policy update (overrides --steps when set)
+    parser.add_argument(
+        "--update-horizon", type=int, default=None,
+        help="Number of sim steps per policy update. If set, overrides --steps."
+    )
     parser.add_argument("--iters", type=int, default=400, help="Training iterations.")
     parser.add_argument("--timing", action="store_true", help="Print timing each iteration and summary.")
     parser.add_argument("--profile", type=str, default="", help="Start TensorBoard trace to this directory.")
@@ -656,6 +780,11 @@ def main(argv: Optional[list] = None):
                         help="EMA alpha in [0,1]; 0 disables smoothing (default: 0.0).")
     parser.add_argument("--metrics-series", type=str, default="loss",
                         help="Comma-separated scalar names to plot (default: 'loss').")
+    # Escape hatch for experiments; default is reset every iter
+    parser.add_argument(
+        "--keep-state", action="store_true",
+        help="Keep drone/map state across iterations (NOT recommended)."
+    )
     args = parser.parse_args(argv)
 
     # Enable persistent compilation cache if available (no XLA flags needed).
@@ -892,6 +1021,10 @@ def main(argv: Optional[list] = None):
     if args.goal_sigma is not None:   sim = sim._replace(goal_sigma=float(args.goal_sigma))
     if args.goal_radius is not None:  sim = sim._replace(goal_radius=float(args.goal_radius))
 
+    # Horizon used by the learn/update call (override via --update-horizon)
+    horizon = int(args.update_horizon) if args.update_horizon is not None else int(sim.steps)
+    sim = sim._replace(steps=horizon)
+
     # small banner so runs are self-describing
     print(f"[cfg] preset={args.preset or 'none'} | "
           f"Sim: steps={sim.steps}  w_coll={sim.w_coll}  w_ctrl={sim.w_ctrl}  "
@@ -903,6 +1036,7 @@ def main(argv: Optional[list] = None):
     print(f"[cfg] bias/kinematics: geom_bias={args.geom_bias:.2f} | w_speed={sim.w_speed} | "
           f"w_alt={sim.w_alt} z∈[{sim.z_min:.2f},{sim.z_max:.2f}] τz={sim.z_tau}")
     print(f"[cfg] mapping: update_every={sim.map_update_every} ray_sub={sim.map_ray_sub} free_samples={sim.map_free_samples}")
+    print(f"[cfg] training horizon (per update): steps={sim.steps}  (override via --update-horizon)")
 
     # Optional TensorBoard trace
     tracedir = args.profile.strip()
@@ -935,14 +1069,48 @@ def main(argv: Optional[list] = None):
     perstep = StepTimes("train_step")
     total_iters = int(max(1, args.iters))
     for it in range(1, total_iters + 1):
-        key, sub = jax.random.split(key)
+        # Fresh RNG for this iteration
+        key, k_map, k_states, k_iter = jax.random.split(key, 4)
+
+        # Always reinitialize the live map (no leakage between iterations)
+        map_iter = init_live_map(k_map, geom_bias=float(args.geom_bias))
+
+        # Always randomize drone initial states
+        states_iter = _sample_initial_states(k_states, int(states0.p.shape[0]), sim)
+
+        # Optionally allow advanced users to keep state (off by default)
+        if args.keep_state:
+            map_iter = mapstate
+            states_iter = states0
+
+        # Within-iteration: perform weight updates every `horizon` steps,
+        # chaining map and state across blocks until reaching `args.steps`.
+        steps_per_iter = int(max(1, args.steps))
+        horizon = int(sim.steps)
+        if steps_per_iter % horizon != 0:
+            blocks = steps_per_iter // horizon
+            if blocks <= 0:
+                blocks = 1
+            if it == 1:
+                print(f"[cfg] warning: steps ({steps_per_iter}) not divisible by update-horizon ({horizon}); "
+                      f"running {blocks} blocks per iter (effective steps={blocks*horizon}).")
+        else:
+            blocks = steps_per_iter // horizon
+
         iter_t0 = time.perf_counter()
-        (policy_params, opt_state, mapstate, loss, metrics), dt = time_blocked(
-            train_step, policy_params, opt_state, mapstate, states0, sub, sim, it, gt_grid
-        )
+        dt_total = 0.0
+        for b in range(blocks):
+            # Fresh PRNG per block
+            k_iter, k_block = jax.random.split(k_iter)
+            sim_block = sim  # steps already set to horizon
+            (policy_params, opt_state, map_iter, loss, metrics, states_iter), dt_b = time_blocked(
+                train_step_with_state, policy_params, opt_state, map_iter, states_iter, k_block, sim_block, (it * 1000 + b), gt_grid
+            )
+            perstep.add(dt_b)
+            dt_total += dt_b
+
         wall = time.perf_counter() - iter_t0
-        gap = wall - dt
-        perstep.add(dt)
+        gap = wall - dt_total
 
         # scalars
         loss_f = float(loss)  # raw loss (may be NaN)
@@ -968,8 +1136,9 @@ def main(argv: Optional[list] = None):
         unorm    = float(metrics.get("update_norm", 0.0))
         umax     = float(metrics.get("update_max", 0.0))
 
-        env_steps = sim.steps / max(1e-9, dt)
-        drone_steps = (sim.steps * states0.p.shape[0]) / max(1e-9, dt)
+        effective_steps = blocks * horizon
+        env_steps = effective_steps / max(1e-9, dt_total)
+        drone_steps = (effective_steps * states_iter.p.shape[0]) / max(1e-9, dt_total)
 
         # When --timing is set, print EVERY iteration so cadence is visible
         if metrics_q is not None and (it % max(1, int(args.metrics_every)) == 0):
@@ -1002,7 +1171,7 @@ def main(argv: Optional[list] = None):
             spd = float(metrics.get("speed_rms", 0.0))
             altp = float(metrics.get("alt_pen", 0.0))
             print(
-                f"[{it:03d}] dt={dt*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
+                f"[{it:03d}] dt={dt_total*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
                 f"coll_w_scale_mean={cws:.3f} | speed_rms={spd:.3e} | alt_pen={altp:.3e} | "
@@ -1018,7 +1187,7 @@ def main(argv: Optional[list] = None):
             spd = float(metrics.get("speed_rms", 0.0))
             altp = float(metrics.get("alt_pen", 0.0))
             print(
-                f"[{it:03d}] dt={dt*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
+                f"[{it:03d}] dt={dt_total*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
                 f"coll_w_scale_mean={cws:.3f} | speed_rms={spd:.3e} | alt_pen={altp:.3e} | "
@@ -1035,7 +1204,7 @@ def main(argv: Optional[list] = None):
             try:
                 viz_steps = int(args.viz_steps) if args.viz_steps is not None else int(sim.steps)
                 key, sub_v = jax.random.split(key)
-                p_seq_dev, q_seq_dev = _rollout_for_viz(policy_params, mapstate, states0, sub_v, sim, viz_steps)
+                p_seq_dev, q_seq_dev = _rollout_for_viz(policy_params, map_iter, states_iter, sub_v, sim, viz_steps)
                 p_seq = np.asarray(jax.device_get(p_seq_dev))
                 q_seq = np.asarray(jax.device_get(q_seq_dev))
                 msg = {"type": "traj", "p": p_seq, "q": q_seq, "dt": float(sim.dyn.dt)}
@@ -1057,11 +1226,15 @@ def main(argv: Optional[list] = None):
             spd = float(metrics.get("speed_rms", 0.0))
             altp = float(metrics.get("alt_pen", 0.0))
             csv_fh.write(
-                f"{it},{dt*1e3:.3f},{wall*1e3:.3f},{gap*1e3:.3f},"
+                f"{it},{dt_total*1e3:.3f},{wall*1e3:.3f},{gap*1e3:.3f},"
                 f"{env_steps:.3f},{drone_steps:.3f},"
                 f"{loss_f:.6e},{recon_f:.6e},{coll_f:.6e},{ctrl_f:.6e},{urms_f:.6e},{grads_f:.6e},{prms_f:.6e},{up_f:.6e},"
                 f"{spd:.6e},{altp:.6e}\n"
             )
+
+        # Persist for optional --keep-state across iterations
+        mapstate = map_iter
+        states0 = states_iter
 
     # Timing summary (exclude the compile+first time from steady-state stats)
     stats = perstep.summary()

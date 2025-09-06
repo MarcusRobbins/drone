@@ -8,7 +8,7 @@ import os
 import numpy as np
 
 # Force software rendering for viewer-only processes (helps on WSLg)
-os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "0")
 
 import pyvista as pv
 
@@ -18,6 +18,17 @@ try:
     _pv_plotter_mod.BasePlotter.__del__ = lambda self: None  # noqa: E731
 except Exception:
     pass
+
+# Report OpenGL backend details for diagnostics
+def _report_gl_backend(pl):
+    try:
+        rw = getattr(pl, "ren_win", None) or getattr(pl, "render_window", None)
+        caps = rw.ReportCapabilities()
+        for line in caps.splitlines():
+            if ("OpenGL vendor" in line) or ("OpenGL renderer" in line) or ("OpenGL version" in line):
+                print("[viz-graph]", line.strip())
+    except Exception as e:
+        print("[viz-graph] GL backend probe failed:", repr(e))
 
 DEFAULT_SERIES = ["loss"]
 
@@ -204,15 +215,36 @@ class MetricsViewer:
                 self.pl.show(auto_close=False)
             except TypeError:
                 self.pl.show()
+        # Print GL backend details once
+        _report_gl_backend(self.pl)
+
+        idle_interval = 0.1  # ~10 Hz UI/event processing when idle
+        last_ui = 0.0
         alive = True
         while alive:
-            drained = False
-            for _ in range(16):
+            try:
+                # Block for a short interval waiting for new messages
+                m = msg_q.get(timeout=idle_interval)
+            except Empty:
+                # Idle: process UI/events at most ~10 Hz
+                now = time.perf_counter()
+                if (now - last_ui) >= idle_interval:
+                    try:
+                        self.pl.update()
+                    except Exception as e:
+                        print(f"[viz-graph] pl.update() error: {e!r} (continuing)")
+                    last_ui = now
+                continue
+
+            # Drain a small burst of queued messages before a single render
+            batch = [m]
+            for _ in range(15):
                 try:
-                    m = msg_q.get_nowait()
+                    batch.append(msg_q.get_nowait())
                 except Empty:
                     break
-                drained = True
+
+            for m in batch:
                 tp = m.get("type", "")
                 if tp == "init":
                     self.on_init(m)
@@ -220,14 +252,9 @@ class MetricsViewer:
                     self.on_metrics(int(m.get("iter", 0)), dict(m.get("scalars", {})))
                 elif tp == "bye":
                     alive = False
-            if not drained:
-                time.sleep(0.01)
-            try:
-                self.pl.update()
-            except Exception as e:
-                print(f"[viewer-metrics] pl.update() error: {e!r} (continuing)")
-                time.sleep(0.25)
-                continue
+
+            # Note: on_metrics triggers a render via _redraw; no extra render here
+
         try:
             self.pl.close()
         except Exception:

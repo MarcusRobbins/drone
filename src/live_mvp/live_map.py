@@ -19,6 +19,12 @@ class HashCfg(NamedTuple):
 
 HASH_CFG = HashCfg()
 
+def _level_res_all(cfg: HashCfg):
+    ls = jnp.arange(cfg.L, dtype=jnp.float32)
+    g = ls / jnp.maximum(cfg.L - 1, 1)
+    Ns = jnp.floor(cfg.N_min * (cfg.N_max / cfg.N_min) ** g).astype(jnp.int32)
+    return Ns
+
 def _level_res(l: int, cfg: HashCfg):
     g = l / max(cfg.L - 1, 1)
     return jnp.floor(cfg.N_min * (cfg.N_max / cfg.N_min) ** g).astype(jnp.int32)
@@ -32,8 +38,10 @@ def _hash_ijk(ijk, T):
          z * jnp.uint32(0xC2B2AE3D))
     return (h & (jnp.uint32(T) - jnp.uint32(1))).astype(jnp.int32)
 
-def _encode_point(tables, x, cfg: HashCfg):
-    # Normalize to [0,1]^3 within AABB
+_OFFS = jnp.array([[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,0,1],[1,0,1],[0,1,1],[1,1,1]], jnp.int32)  # (8,3)
+
+def _encode_point_ref(tables, x, cfg: HashCfg):
+    # Original per-level, per-corner encoder (reference)
     u = (x - cfg.lb) / (cfg.ub - cfg.lb + 1e-9)
     u = jnp.clip(u, 0.0, 1.0)
     feats = []
@@ -51,11 +59,49 @@ def _encode_point(tables, x, cfg: HashCfg):
                     wxyz = ((t[0] if dx else 1.0 - t[0]) *
                             (t[1] if dy else 1.0 - t[1]) *
                             (t[2] if dz else 1.0 - t[2]))
-                    hid = _hash_ijk(corner, HASH_CFG.T)
+                    hid = _hash_ijk(corner, cfg.T)
                     emb_l = tables[l][hid]  # (F,)
                     emb = emb + wxyz * emb_l
         feats.append(emb)
     return jnp.concatenate(feats, axis=0)  # (L*F,)
+
+def _encode_point_fused_LTF(tables_LTF: jnp.ndarray, x: jnp.ndarray, cfg: HashCfg):
+    # Fused across levels and 8 corners; expects tables stacked as (L,T,F)
+    u = (x - cfg.lb) / (cfg.ub - cfg.lb + 1e-9)
+    u = jnp.clip(u, 0.0, 1.0)
+    Ns = _level_res_all(cfg).astype(jnp.float32)            # (L,)
+    ugrid = u[None,:] * (Ns - 1.0)[:,None]                  # (L,3)
+    i0 = jnp.floor(ugrid).astype(jnp.int32)                 # (L,3)
+    t = (ugrid - i0.astype(jnp.float32))                    # (L,3)
+    # Clip per-level, broadcasting the max bound over xyz axis.
+    i0 = jnp.clip(i0, 0, (Ns.astype(jnp.int32) - 2)[:, None])
+
+    corners = i0[:,None,:] + _OFFS[None,:,:]                # (L,8,3)
+    h = _hash_ijk(corners, cfg.T)                           # (L,8)
+    # Gather features per level along the T axis.
+    # Expand indices to (L,8,F) so they match arr's non-axis dims (L,*,F).
+    L, F = tables_LTF.shape[0], tables_LTF.shape[2]
+    h_exp = jnp.broadcast_to(h[..., None], (L, h.shape[1], F))  # (L,8,F)
+    emb = jnp.take_along_axis(tables_LTF, h_exp, axis=1)        # (L,8,F)
+
+    wx = jnp.where(_OFFS[None,:,0]==1, t[:,None,0], 1.0 - t[:,None,0])
+    wy = jnp.where(_OFFS[None,:,1]==1, t[:,None,1], 1.0 - t[:,None,1])
+    wz = jnp.where(_OFFS[None,:,2]==1, t[:,None,2], 1.0 - t[:,None,2])
+    w = (wx * wy * wz).astype(emb.dtype)                    # (L,8)
+    per_level = jnp.sum(w[...,None] * emb, axis=1)          # (L,F)
+    return per_level.reshape(-1)                            # (L*F,)
+
+def _encode_point_fused(tables_tuple, x, cfg: HashCfg):
+    # Accepts tuple-of-levels (T,F), stacks to (L,T,F)
+    tables_LTF = jnp.stack(tables_tuple, axis=0)
+    return _encode_point_fused_LTF(tables_LTF, x, cfg)
+
+# Toggle between reference and fused encoders via env var.
+_FUSED_ENCODER = os.environ.get("LIVEMVP_FUSED_ENCODER", "1") in ("1", "true", "True")
+
+def _encode_point(tables, x, cfg: HashCfg):
+    return (_encode_point_fused(tables, x, cfg)
+            if _FUSED_ENCODER else _encode_point_ref(tables, x, cfg))
 
 v_encode = jax.vmap(_encode_point, in_axes=(None,0,None))
 

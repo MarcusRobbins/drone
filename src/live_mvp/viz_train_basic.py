@@ -8,7 +8,7 @@ import os
 import numpy as np
 
 # Force software rendering for viewer-only processes (helps on WSLg)
-os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "0")
 
 import pyvista as pv
 
@@ -18,6 +18,20 @@ try:
     _pv_plotter_mod.BasePlotter.__del__ = lambda self: None  # noqa: E731
 except Exception:
     pass
+
+# Report OpenGL backend details for diagnostics
+def _report_gl_backend(pl):
+    try:
+        rw = getattr(pl, "ren_win", None) or getattr(pl, "render_window", None)
+        caps = rw.ReportCapabilities()
+        for line in caps.splitlines():
+            if ("OpenGL vendor" in line) or ("OpenGL renderer" in line) or ("OpenGL version" in line):
+                print("[viz-sim]", line.strip())
+    except Exception as e:
+        print("[viz-sim] GL backend probe failed:", repr(e))
+
+# Cap for GT points drawn (performance guardrail)
+MAX_GT_PTS = 50000
 
 # --- Quaternion helpers (NumPy only; no JAX here) ---
 def quat_to_R_numpy(q: np.ndarray) -> np.ndarray:
@@ -198,15 +212,53 @@ class BasicTrainViewer:
         pts = np.asarray(pts, np.float32)
         if pts.size == 0:
             return
+        # Downsample to a fixed budget if needed
+        try:
+            if pts.shape[0] > MAX_GT_PTS:
+                sel = np.random.choice(pts.shape[0], MAX_GT_PTS, replace=False)
+                pts = pts[sel]
+        except Exception:
+            pass
+        # Remove previous actor if any
         try:
             if self.gt_actor is not None:
                 self.pl.remove_actor(self.gt_actor)
         except Exception:
             pass
+        # Build polydata and render as lightweight points (not shaded spheres)
         self.gt_poly = make_point_cloud_polydata(pts)
-        self.gt_actor = self.pl.add_mesh(
-            self.gt_poly, color="lightgray", render_points_as_spheres=True, point_size=4.5
-        )
+        try:
+            self.gt_actor = self.pl.add_mesh(
+                self.gt_poly,
+                style="points",
+                render_points_as_spheres=False,
+                point_size=2.0,
+                color="lightgray",
+                lighting=False,
+                pickable=False,
+            )
+        except TypeError:
+            # Fallback for older pyvista that may not support some kwargs
+            self.gt_actor = self.pl.add_mesh(
+                self.gt_poly,
+                style="points",
+                point_size=2.0,
+                color="lightgray",
+            )
+        # Disable MSAA/FXAA to reduce fragment work
+        try:
+            rw = getattr(self.pl, "ren_win", None) or getattr(self.pl, "render_window", None)
+            if rw is not None:
+                try:
+                    rw.SetMultiSamples(0)
+                except Exception:
+                    pass
+                try:
+                    rw.SetUseFXAA(0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def set_goal_points(self, pts: np.ndarray):
         pts = np.asarray(pts, np.float32)
@@ -310,16 +362,49 @@ class BasicTrainViewer:
                 self.pl.show(auto_close=False)
             except TypeError:
                 self.pl.show()
+        # Print GL backend details once
+        _report_gl_backend(self.pl)
 
+        idle_ui_interval = 0.1  # ~10 Hz UI/event processing when idle
+        last_ui = 0.0
         alive = True
         while alive:
-            drained = False
-            for _ in range(8):
+            try:
+                # Wait briefly for new messages; avoids busy render loop
+                m = msg_q.get(timeout=idle_ui_interval)
+            except Empty:
+                # Idle tick: advance playback if due, and throttle UI updates
+                did_update = False
+                if self.pb.step_if_due() and self.pb.p_seq is not None:
+                    self.update_drones(self.pb.p_seq[self.pb.idx])
+                    self.update_arrows()
+                    self.update_hud()
+                    try:
+                        self.pl.render()
+                    except Exception:
+                        pass
+                    did_update = True
+
+                # Keep window responsive at most ~10 Hz
+                now = time.perf_counter()
+                if (now - last_ui) >= idle_ui_interval and not did_update:
+                    try:
+                        self.pl.update()
+                    except Exception as e:
+                        print(f"[viz-sim] pl.update() error: {e!r} (continuing)")
+                    last_ui = now
+                continue
+
+            # Drain a small burst of queued messages so we render once after applying them
+            batch = [m]
+            for _ in range(7):
                 try:
-                    m = msg_q.get_nowait()
+                    batch.append(msg_q.get_nowait())
                 except Empty:
                     break
-                drained = True
+
+            need_render = False
+            for m in batch:
                 tp = m.get("type")
                 if tp == "init":
                     self.lb = np.asarray(m.get("lb", self.lb), np.float32)
@@ -328,6 +413,7 @@ class BasicTrainViewer:
                     self.set_gt_points(pts)
                     goals = np.asarray(m.get("goal_points", np.zeros((0, 3), np.float32)), np.float32)
                     self.set_goal_points(goals)
+                    need_render = True
                 elif tp == "traj":
                     p = np.asarray(m["p"], np.float32)
                     qv = m.get("q", None)
@@ -335,28 +421,20 @@ class BasicTrainViewer:
                     dt = float(m.get("dt", 0.05))
                     self.pb.set_traj(p, q_seq, dt)
                     self.ensure_drone_poly(self.pb.N)
+                    # Render initial frame immediately
+                    if self.pb.p_seq is not None:
+                        self.update_drones(self.pb.p_seq[self.pb.idx])
+                        self.update_arrows()
+                        need_render = True
                 elif tp == "bye":
                     alive = False
 
-            if self.pb.step_if_due() and self.pb.p_seq is not None:
-                self.update_drones(self.pb.p_seq[self.pb.idx])
-                self.update_arrows()
-
-            if (not self.pb.playing) and self.pb.p_seq is not None:
-                self.update_drones(self.pb.p_seq[self.pb.idx])
-                self.update_arrows()
-
             self.update_hud()
-
-            try:
-                self.pl.update()
-            except Exception as e:
-                # Keep the window alive and keep trying; log once per hiccup
-                print(f"[viewer-basic] pl.update() error: {e!r} (continuing)")
-                time.sleep(0.25)
-                continue
-
-            time.sleep(0.01)
+            if need_render:
+                try:
+                    self.pl.render()
+                except Exception:
+                    pass
 
         try:
             self.pl.close()
