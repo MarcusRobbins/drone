@@ -42,3 +42,6 @@ python -m live_mvp.train_live
 - `dyn.py`     : Simple differentiable kinematics & quaternion utilities.
 - `policy.py`  : Non‑learned **anchor‑lattice** and **unseen compass** features, and a tiny MLP for the policy.
 - `train_live.py`: Fused `train_step` (JIT/GPU); rollout loop that updates the live map, computes reward **from the live map**, and trains the policy.
+
+
+python -m live_mvp.train_live --preset coverage --drones 4 --steps 200 --iters 4000 --viz --viz-steps 200 --viz-every 20 --coll-warmup-steps 50 --coll-warmup-ramp 50 --geom-bias 0.3 --w-speed 0.01 --w-alt 0.02 --map-update-every 2 --map-ray-sub 6 --map-free-samples 16 --viz-metrics --act-noise 0.2

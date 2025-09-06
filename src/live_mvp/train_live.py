@@ -156,24 +156,25 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
                 t = raycast_depth_gt(p_sg, d_sg)                  # full-scene GT depth (no-grad)
                 stop_t = jnp.where(jnp.isnan(t), sim.rcfg.t1, t)
                 xs = p_sg[None, :] + ts[:, None] * d_sg[None, :]  # (SFS,3) (no-grad)
-                # free-space mask: everything strictly before stop_t
+                # free-space strictly before the hit
                 m_free = (ts < stop_t).astype(jnp.float32)        # (SFS,)
-                # exposure weights ~ 1/r^2 (softened)
-                r = ts
-                w_seen = m_free / (1.0 + r * r)
+                w_free = m_free / (1.0 + ts * ts)
+                # occluded strictly after the hit (bounded by t1)
+                m_occ  = (ts > stop_t).astype(jnp.float32)        # (SFS,)
+                w_occ  = m_occ / (1.0 + ts * ts)
                 # hit point & mask
                 x_hit = p_sg + stop_t * d_sg
                 m_hit = jnp.isfinite(t).astype(jnp.float32) * (t <= sim.rcfg.t1)
-                return x_hit, m_hit, xs, m_free, w_seen
+                return x_hit, m_hit, xs, m_free, w_free, xs, m_occ, w_occ
 
-            hits, m_hits, frees, m_frees, w_seens = jax.vmap(per_ray)(sel)
+            hits, m_hits, frees, m_frees, w_frees, occs, m_occs, w_occs = jax.vmap(per_ray)(sel)
             # simple counts for debug
             n_hit = jnp.sum(m_hits)
             n_free = jnp.sum(m_frees)
             # Update live map (masked/weighted). These updates optimize map params internally,
             # but for policy training we treat the resulting mapstate as a constant.
             ms = update_geom(ms, hits, m_hits, frees, m_frees)
-            ms = update_expo(ms, frees, w_seens)
+            ms = update_expo(ms, frees, w_frees, occs, w_occs, neg_weight=0.7)
             ms = jtu.tree_map(jax.lax.stop_gradient, ms)  # CUT GRADIENTS into map
             # print for first drone only, at the chosen cadence
             _dbg_print(jnp.logical_and(_dbg_mask_for_step(t), i == 0),
@@ -672,9 +673,11 @@ def main(argv: Optional[list] = None):
         # N drones (shared map)
         N = int(max(1, args.drones))
         def init_state(i):
-            # spread along y for a non-degenerate start
+            # spread along y and give each drone a distinct yaw
             p = jnp.array([0., 0.9 * (i - (N - 1) / 2.0), 1.6])
-            v = jnp.zeros(3); q = jnp.array([1., 0., 0., 0.]); w = jnp.zeros(3)
+            yaw = (2 * jnp.pi / jnp.maximum(1, N)) * i
+            q = jnp.array([jnp.cos(0.5*yaw), 0., 0., jnp.sin(0.5*yaw)])  # [w,x,y,z]
+            v = jnp.zeros(3); w = jnp.zeros(3)
             return State(p, v, q, w)
         states0 = jax.vmap(init_state)(jnp.arange(N))
 

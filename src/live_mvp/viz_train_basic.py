@@ -4,8 +4,20 @@ from dataclasses import dataclass
 from typing import Optional
 from queue import Empty
 
+import os
 import numpy as np
+
+# Force software rendering for viewer-only processes (helps on WSLg)
+os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+
 import pyvista as pv
+
+# Quell noisy destructor AttributeErrors on some PyVista builds
+try:
+    from pyvista.plotting import plotter as _pv_plotter_mod  # type: ignore
+    _pv_plotter_mod.BasePlotter.__del__ = lambda self: None  # noqa: E731
+except Exception:
+    pass
 
 # --- Quaternion helpers (NumPy only; no JAX here) ---
 def quat_to_R_numpy(q: np.ndarray) -> np.ndarray:
@@ -338,8 +350,11 @@ class BasicTrainViewer:
 
             try:
                 self.pl.update()
-            except Exception:
-                alive = False
+            except Exception as e:
+                # Keep the window alive and keep trying; log once per hiccup
+                print(f"[viewer-basic] pl.update() error: {e!r} (continuing)")
+                time.sleep(0.25)
+                continue
 
             time.sleep(0.01)
 

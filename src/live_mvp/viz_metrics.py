@@ -4,8 +4,20 @@ from collections import deque
 from queue import Empty
 from typing import Dict, List
 
+import os
 import numpy as np
+
+# Force software rendering for viewer-only processes (helps on WSLg)
+os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+
 import pyvista as pv
+
+# Quell noisy destructor AttributeErrors on some PyVista builds
+try:
+    from pyvista.plotting import plotter as _pv_plotter_mod  # type: ignore
+    _pv_plotter_mod.BasePlotter.__del__ = lambda self: None  # noqa: E731
+except Exception:
+    pass
 
 DEFAULT_SERIES = ["loss"]
 
@@ -212,8 +224,10 @@ class MetricsViewer:
                 time.sleep(0.01)
             try:
                 self.pl.update()
-            except Exception:
-                alive = False
+            except Exception as e:
+                print(f"[viewer-metrics] pl.update() error: {e!r} (continuing)")
+                time.sleep(0.25)
+                continue
         try:
             self.pl.close()
         except Exception:
