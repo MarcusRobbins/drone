@@ -139,65 +139,76 @@ def _rollout_loss_impl(pp, mapstate: MapState, states0, key, sim: SimCfg, iter_i
     def one_step(carry, t):
         key, states, mapstate = carry
 
-        # === 1) Online mapping: simulate depth on GT, update live map ===
-        def update_from_drone(i, ms):
-            p = states.p[i]; q = states.q[i]
-            rays_w = body_rays_world(q, RAYS_BODY)
-            idx = jnp.arange(0, RAYS_BODY.shape[0], int(sim.map_ray_sub))
-            sel = rays_w[idx]
-
-            # Fixed sample positions along each ray; mask beyond measured depth
-            SFS = int(sim.map_free_samples)
-            ts = jnp.linspace(sim.rcfg.t0, sim.rcfg.t1, SFS)     # (SFS,)
-
-            def per_ray(d):
-                # --- CUT GRADIENTS through GT sensing & sampling geometry ---
-                p_sg = jax.lax.stop_gradient(p)
-                d_sg = jax.lax.stop_gradient(d)
-                # Use fast cached grid when provided; otherwise analytic fallback.
-                if gt_grid is not None:
-                    t = raycast_depth_grid_cached(
-                        p_sg, d_sg, gt_grid, t_max=sim.rcfg.t1, eps=0.01, iters=48
-                    )
-                else:
-                    t = raycast_depth_gt(p_sg, d_sg)
-                stop_t = jnp.where(jnp.isnan(t), sim.rcfg.t1, t)
-                xs = p_sg[None, :] + ts[:, None] * d_sg[None, :]  # (SFS,3) (no-grad)
-                # free-space strictly before the hit
-                m_free = (ts < stop_t).astype(jnp.float32)        # (SFS,)
-                w_free = m_free / (1.0 + ts * ts)
-                # occluded strictly after the hit (bounded by t1)
-                m_occ  = (ts > stop_t).astype(jnp.float32)        # (SFS,)
-                w_occ  = m_occ / (1.0 + ts * ts)
-                # hit point & mask
-                x_hit = p_sg + stop_t * d_sg
-                m_hit = jnp.isfinite(t).astype(jnp.float32) * (t <= sim.rcfg.t1)
-                return x_hit, m_hit, xs, m_free, w_free, xs, m_occ, w_occ
-
-            hits, m_hits, frees, m_frees, w_frees, occs, m_occs, w_occs = jax.vmap(per_ray)(sel)
-            # simple counts for debug
-            n_hit = jnp.sum(m_hits)
-            n_free = jnp.sum(m_frees)
-            # Update live map (masked/weighted). These updates optimize map params internally,
-            # but for policy training we treat the resulting mapstate as a constant.
-            ms = update_geom(ms, hits, m_hits, frees, m_frees)
-            ms = update_expo(ms, frees, w_frees, occs, w_occs, neg_weight=0.7)
-            ms = jtu.tree_map(jax.lax.stop_gradient, ms)  # CUT GRADIENTS into map
-            # print for first drone only, at the chosen cadence
-            _dbg_print(jnp.logical_and(_dbg_mask_for_step(t), i == 0),
-                       "[dbg] t={:d} map_update: hits={} free={}", t, n_hit, n_free)
-            return ms
-
+        # === 1) Online mapping batched across all drones ===
         # Optional: skip mapping entirely when verifying the loop with goals
         if (not sim.skip_mapping) and (sim.w_recon > 0.0):
             do_map = ((t % int(sim.map_update_every)) == 0)
+
+            def _collect_all(states_):
+                # Rays in world for all drones: (N, M, 3) -> subsample to (N, M', 3)
+                rays_all = jax.vmap(lambda q: body_rays_world(q, RAYS_BODY))(states_.q)
+                idx = jnp.arange(0, RAYS_BODY.shape[0], int(sim.map_ray_sub))
+                sel = rays_all[:, idx, :]
+
+                # Fixed sample positions along each ray
+                SFS = int(sim.map_free_samples)
+                ts = jnp.linspace(sim.rcfg.t0, sim.rcfg.t1, SFS)  # (SFS,)
+
+                def per_ray(o, d):
+                    # Cut gradients through GT sensing & sampling geometry
+                    o_sg = jax.lax.stop_gradient(o)
+                    d_sg = jax.lax.stop_gradient(d)
+                    if gt_grid is not None:
+                        t_hit = raycast_depth_grid_cached(
+                            o_sg, d_sg, gt_grid, t_max=sim.rcfg.t1, eps=0.01, iters=48
+                        )
+                    else:
+                        t_hit = raycast_depth_gt(o_sg, d_sg)
+                    stop_t = jnp.where(jnp.isnan(t_hit), sim.rcfg.t1, t_hit)
+                    xs = o_sg[None, :] + ts[:, None] * d_sg[None, :]  # (SFS,3)
+                    # free-space strictly before the hit
+                    m_free = (ts < stop_t).astype(jnp.float32)        # (SFS,)
+                    w_free = m_free / (1.0 + ts * ts)
+                    # occluded strictly after the hit (bounded by t1)
+                    m_occ  = (ts > stop_t).astype(jnp.float32)        # (SFS,)
+                    w_occ  = m_occ / (1.0 + ts * ts)
+                    # hit point & mask
+                    x_hit = o_sg + stop_t * d_sg
+                    m_hit = jnp.isfinite(t_hit).astype(jnp.float32) * (t_hit <= sim.rcfg.t1)
+                    return x_hit, m_hit, xs, m_free, w_free, xs, m_occ, w_occ
+
+                # Vectorize over drones and their selected rays
+                def per_drone(o, dirs):
+                    return jax.vmap(lambda d: per_ray(o, d))(dirs)
+
+                hits, m_hits, frees, m_frees, w_frees, occs, m_occs, w_occs = \
+                    jax.vmap(per_drone)(states_.p, sel)
+
+                # Flatten (N, M', ...) -> (R, ...), keeping sample dim S intact
+                def flat_R3(x):
+                    return x.reshape(-1, x.shape[-1])
+                def flat_R(x):
+                    return x.reshape(-1)
+                def flat_RS(x):
+                    return x.reshape(-1, x.shape[-1])
+                def flat_RS3(x):
+                    return x.reshape(-1, x.shape[-2], x.shape[-1])
+
+                return (flat_R3(hits), flat_R(m_hits),
+                        flat_RS3(frees), flat_RS(m_frees),
+                        flat_RS3(occs),  flat_RS(m_occs),
+                        flat_RS(w_frees), flat_RS(w_occs))
+
             def _run_map(ms_in):
-                ms1 = jax.lax.fori_loop(0, N, update_from_drone, ms_in)
+                h, mh, fr, mfr, oc, moc, wfr, woc = _collect_all(states)
+                ms1 = update_geom(ms_in, h, mh, fr, mfr)
+                ms1 = update_expo(ms1, fr, wfr, oc, woc, neg_weight=0.7)
+                # Cut grads and sanitize like before
+                ms1 = jtu.tree_map(jax.lax.stop_gradient, ms1)
                 ms1 = _sanitize_mapstate(ms1)
                 return ms1
-            def _no_map(ms_in):
-                return ms_in
-            mapstate = jax.lax.cond(do_map, _run_map, _no_map, mapstate)
+
+            mapstate = jax.lax.cond(do_map, _run_map, lambda x: x, mapstate)
         else:
             mapstate = mapstate  # pass-through
 

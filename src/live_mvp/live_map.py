@@ -109,8 +109,17 @@ class MapState(NamedTuple):
     geom: GeomState
     expo: ExpoState
 
-_G_OPT_TX = optax.adam(1e-3)
-_E_OPT_TX = optax.adam(1e-3)
+# Gradient accumulation for mapping via Optax apply_every.
+# Controlled by env var LIVEMVP_MAP_ACCUM (default 1 = no accumulation).
+_APPLY_EVERY_K = int(os.environ.get("LIVEMVP_MAP_ACCUM", "1"))
+
+if _APPLY_EVERY_K <= 1:
+    _G_OPT_TX = optax.adam(1e-3)
+    _E_OPT_TX = optax.adam(1e-3)
+else:
+    # Accumulate grads for K steps, then apply once.
+    _G_OPT_TX = optax.chain(optax.adam(1e-3), optax.apply_every(_APPLY_EVERY_K))
+    _E_OPT_TX = optax.chain(optax.adam(1e-3), optax.apply_every(_APPLY_EVERY_K))
 
 # ---------- Debug / safety helpers ----------
 _DBG = os.environ.get("LIVEMVP_DEBUG", "0") in ("1", "true", "True")
