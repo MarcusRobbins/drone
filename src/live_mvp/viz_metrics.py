@@ -8,7 +8,7 @@ import os
 import numpy as np
 
 # Force software rendering for viewer-only processes (helps on WSLg)
-os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "0")
+# os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "0")
 
 import pyvista as pv
 

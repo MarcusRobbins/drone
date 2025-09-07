@@ -8,7 +8,7 @@ import os
 import numpy as np
 
 # Force software rendering for viewer-only processes (helps on WSLg)
-os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "0")
+# os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "0")
 
 import pyvista as pv
 
@@ -133,7 +133,10 @@ class BasicTrainViewer:
         self.pb = Playback()
 
         self.hud_actor = None
-        self.arrow_actor = None  # camera/heading arrows overlay
+        self._last_hud_update = 0.0
+        self.arrow_actor = None  # legacy arrow glyphs (unused after optimization)
+        self.arrow_lines_poly = None  # persistent polydata for arrow line segments
+        self.arrow_lines_actor = None  # persistent actor for arrow line segments
 
         self.speed_slider = None
         self._add_speed_slider()
@@ -305,54 +308,113 @@ class BasicTrainViewer:
             pass
         self.arrow_actor = None
 
+    def _ensure_arrow_lines(self, N: int):
+        """Create or resize the persistent polyline actor for N drones."""
+        if self.arrow_lines_poly is not None:
+            try:
+                if int(self.arrow_lines_poly.n_points) == 2 * N:
+                    return
+            except Exception:
+                pass
+        try:
+            if self.arrow_lines_actor is not None:
+                self.pl.remove_actor(self.arrow_lines_actor)
+        except Exception:
+            pass
+        pts = np.zeros((2 * N, 3), np.float32)  # start/end per drone
+        lines = np.empty((N, 3), np.int64)
+        lines[:, 0] = 2
+        base = np.arange(N, dtype=np.int64)
+        lines[:, 1] = 2 * base
+        lines[:, 2] = 2 * base + 1
+        poly = pv.PolyData()
+        poly.points = pts
+        poly.lines = lines
+        self.arrow_lines_poly = poly
+        try:
+            self.arrow_lines_actor = self.pl.add_mesh(
+                poly, color="cyan", line_width=2.0, lighting=False, pickable=False
+            )
+        except TypeError:
+            self.arrow_lines_actor = self.pl.add_mesh(poly, color="cyan", line_width=2.0)
+
     def update_arrows(self):
-        """
-        Overlay a cyan arrow per drone showing the camera forward direction.
-        Requires both p_seq and q_seq; no-ops (and hides) otherwise.
-        """
+        """Update heading arrows using a persistent line actor (no actor churn)."""
         if self.pb.p_seq is None or self.pb.q_seq is None or self.pb.T == 0:
-            self._remove_arrow_actor()
+            # Hide if no data
+            if self.arrow_lines_actor is not None:
+                try:
+                    self.arrow_lines_actor.SetVisibility(False)
+                except Exception:
+                    pass
             return
 
         idx = int(self.pb.idx)
-        p_now = np.asarray(self.pb.p_seq[idx], np.float32)   # (N,3)
-        q_now = np.asarray(self.pb.q_seq[idx], np.float32)   # (N,4)
+        p_now = np.asarray(self.pb.p_seq[idx], np.float32)  # (N,3)
+        q_now = np.asarray(self.pb.q_seq[idx], np.float32)  # (N,4)
         N = p_now.shape[0]
+        self._ensure_arrow_lines(N)
+        if self.arrow_lines_actor is not None:
+            try:
+                self.arrow_lines_actor.SetVisibility(True)
+            except Exception:
+                pass
 
-        fwd = np.zeros_like(p_now, dtype=np.float32)
+        fwd = np.zeros_like(p_now, np.float32)
         for i in range(N):
             try:
                 fwd[i] = quat_to_forward_numpy(q_now[i])
             except Exception:
                 fwd[i] = np.array([1.0, 0.0, 0.0], np.float32)
+        fwd /= (np.linalg.norm(fwd, axis=1, keepdims=True) + 1e-9)
+        fwd *= 0.8  # arrow length ~0.8m
 
-        # Normalize and scale arrows to a readable length
-        norms = np.linalg.norm(fwd, axis=1, keepdims=True) + 1e-9
-        fwd = (fwd / norms) * 0.8  # arrow length ~0.8m
-
-        # Recreate the arrows each frame for simplicity/robustness
-        self._remove_arrow_actor()
+        # In-place point update: [start0, end0, start1, end1, ...]
         try:
-            self.arrow_actor = self.pl.add_arrows(p_now, fwd, mag=1.0, color="cyan")
+            pts = self.arrow_lines_poly.points
+            pts[0::2] = p_now
+            pts[1::2] = p_now + fwd
+            self.arrow_lines_poly.points = pts
         except Exception:
-            # If arrows fail for any reason, ensure the overlay is off instead of crashing
-            self.arrow_actor = None
+            # Fallback: rebuild lines on next call
+            self.arrow_lines_poly = None
 
-    def update_hud(self):
-        try:
-            if self.hud_actor is not None:
-                self.pl.remove_actor(self.hud_actor)
-        except Exception:
-            pass
-        t = self.pb.idx
-        T = max(1, self.pb.T)
+    def update_hud(self, throttle: float = 0.15):
+        """Update HUD text in place, throttled to avoid render contention."""
+        now = time.perf_counter()
+        if (now - getattr(self, "_last_hud_update", 0.0)) < throttle:
+            return
+        self._last_hud_update = now
+
+        t = int(self.pb.idx)
+        T = max(1, int(self.pb.T))
         status = (
             f"frame {t+1}/{T}   "
             f"{'PLAY' if self.pb.playing else 'PAUSE'}   "
             f"speed×{self.pb.speed:.2f}   "
             f"N={self.pb.N}"
         )
-        self.hud_actor = self.pl.add_text(status, font_size=10, color="white")
+
+        if self.hud_actor is None:
+            self.hud_actor = self.pl.add_text("", font_size=10, color="white")
+        try:
+            self.hud_actor.SetInput(status)
+        except Exception:
+            # Fallback: recreate once if SetInput isn't available
+            try:
+                self.pl.remove_actor(self.hud_actor)
+            except Exception:
+                pass
+            self.hud_actor = self.pl.add_text(status, font_size=10, color="white")
+
+    def _pump_events(self):
+        """Explicitly process UI events to keep interaction responsive."""
+        try:
+            iren = getattr(self.pl, "iren", None)
+            if iren is not None:
+                iren.ProcessEvents()
+        except Exception:
+            pass
 
     def run(self, msg_q):
         try:
@@ -365,7 +427,7 @@ class BasicTrainViewer:
         # Print GL backend details once
         _report_gl_backend(self.pl)
 
-        idle_ui_interval = 0.1  # ~10 Hz UI/event processing when idle
+        idle_ui_interval = 0.016  # ~60 Hz event processing when idle
         last_ui = 0.0
         alive = True
         while alive:
@@ -381,8 +443,8 @@ class BasicTrainViewer:
                     self.update_hud()
                     try:
                         self.pl.render()
-                    except Exception:
-                        pass
+                    finally:
+                        self._pump_events()
                     did_update = True
 
                 # Keep window responsive at most ~10 Hz
@@ -390,8 +452,8 @@ class BasicTrainViewer:
                 if (now - last_ui) >= idle_ui_interval and not did_update:
                     try:
                         self.pl.update()
-                    except Exception as e:
-                        print(f"[viz-sim] pl.update() error: {e!r} (continuing)")
+                    finally:
+                        self._pump_events()
                     last_ui = now
                 continue
 
@@ -420,6 +482,9 @@ class BasicTrainViewer:
                     q_seq = None if qv is None else np.asarray(qv, np.float32)
                     dt = float(m.get("dt", 0.05))
                     self.pb.set_traj(p, q_seq, dt)
+                    # Reset playback state for new trajectories
+                    self.pb.playing = True
+                    self.pb.idx = 0
                     self.ensure_drone_poly(self.pb.N)
                     # Render initial frame immediately
                     if self.pb.p_seq is not None:
@@ -433,8 +498,8 @@ class BasicTrainViewer:
             if need_render:
                 try:
                     self.pl.render()
-                except Exception:
-                    pass
+                finally:
+                    self._pump_events()
 
         try:
             self.pl.close()
