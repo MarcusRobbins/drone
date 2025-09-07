@@ -9,7 +9,7 @@ import numpy as np
 from .env_gt import raycast_depth_gt
 from .env_gt import build_gt_grid, raycast_depth_grid as raycast_depth_grid_cached
 from .env_gt import set_gt_config, get_gt_config
-from .live_map import init_live_map, update_geom, update_expo, MapState, GeomState, ExpoState, HASH_CFG, G_phi
+from .live_map import init_live_map, update_geom, update_expo, MapState, GeomState, ExpoState, HASH_CFG, G_phi, v_G, v_Q
 from .render import RenderCfg, recon_reward_for_ray
 from .dyn import State, DynCfg, step, body_rays_world, R_from_q
 from .policy import init_mlp, mlp_apply, anchor_features, ANCHOR_FEAT_DIM
@@ -773,6 +773,18 @@ def main(argv: Optional[list] = None):
     parser.add_argument("--viz", action="store_true", help="Enable basic viewer (GT + drone markers).")
     parser.add_argument("--viz-steps", type=int, default=None, help="Frames per snapshot (default: --steps).")
     parser.add_argument("--viz-every", type=int, default=1, help="Emit a snapshot every K iterations (default: 1).")
+    parser.add_argument(
+        "--viz-field", type=str, default="Q",
+        choices=["Q", "vis", "phi", "mask", "solid"],
+        help=(
+            "Field to visualize in middle pane: "
+            "Q=exposure (free-space high), "
+            "vis=Q*(1-|phi|/eps) (surfaces high), "
+            "phi=|phi| (distance to surface), "
+            "mask=1-|phi|/eps (near-surface mask), "
+            "solid=1-Q (free-space low)."
+        ),
+    )
     # ----- Metrics live viewer -----
     parser.add_argument("--viz-metrics", action="store_true",
                         help="Open a live metrics window (loss and selected scalars).")
@@ -865,7 +877,8 @@ def main(argv: Optional[list] = None):
             pass
         try:
             from .viz_train_basic import run_viz_basic
-            viz_q = mp.Queue(maxsize=2)
+            # Larger queue so logs don't choke the viewer on Windows
+            viz_q = mp.Queue(maxsize=128)
             viz_proc = mp.Process(target=run_viz_basic, args=(viz_q,), daemon=True)
             viz_proc.start()
         except Exception as e:
@@ -878,6 +891,22 @@ def main(argv: Optional[list] = None):
             except Exception as e:
                 print(f"[viz] GT shell compute failed: {e!r}")
                 gt_pts = np.zeros((0, 3), np.float32)
+            # Build a coarse, fixed live grid once for the right pane (lightweight)
+            def _live_grid_points(res_xyz=(32, 32, 16)):
+                try:
+                    lb_np = np.asarray(jax.device_get(HASH_CFG.lb), np.float32)
+                    ub_np = np.asarray(jax.device_get(HASH_CFG.ub), np.float32)
+                except Exception:
+                    lb_np = np.array([-6.0, -6.0, 0.0], np.float32)
+                    ub_np = np.array([+6.0, +6.0, 4.0], np.float32)
+                rx, ry, rz = [int(res_xyz[0]), int(res_xyz[1]), int(res_xyz[2])]
+                xs = np.linspace(lb_np[0], ub_np[0], rx, dtype=np.float32)
+                ys = np.linspace(lb_np[1], ub_np[1], ry, dtype=np.float32)
+                zs = np.linspace(lb_np[2], ub_np[2], rz, dtype=np.float32)
+                X, Y, Z = np.meshgrid(xs, ys, zs, indexing="xy")
+                pts = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float32)
+                return pts
+            live_pts_viz = _live_grid_points(res_xyz=(32, 32, 16))
             # Optional goal markers (decoupled from sim init)
             goal_pts = np.zeros((0, 3), np.float32)
             try:
@@ -902,39 +931,25 @@ def main(argv: Optional[list] = None):
                 lb = np.array([-6.0, -6.0, 0.0], np.float32)
                 ub = np.array([+6.0, +6.0, 4.0], np.float32)
             try:
-                viz_q.put({"type": "init", "gt_points": gt_pts, "goal_points": goal_pts, "lb": lb, "ub": ub})
+                viz_q.put({
+                    "type": "init",
+                    "gt_points": gt_pts,
+                    "goal_points": goal_pts,
+                    "lb": lb,
+                    "ub": ub,
+                    "live_pts": live_pts_viz,
+                })
             except Exception as e:
                 print(f"[viz] send init failed: {e!r}")
 
-    # ---- Metrics viewer ----
-    if args.viz_metrics:
-        try:
-            if not args.viz:
-                try:
-                    mp.set_start_method("spawn")
-                except RuntimeError:
-                    pass
-            from .viz_metrics import run_metrics
-            metrics_q = mp.Queue(maxsize=64)
-            metrics_proc = mp.Process(target=run_metrics, args=(metrics_q,), daemon=True)
-            metrics_proc.start()
-            print("[metrics] viewer started")
-            series = [s.strip() for s in (args.metrics_series or "").split(",") if s.strip()]
-            init_msg = {
-                "type": "init",
-                "series": series or ["loss"],
-                "window": int(max(100, args.metrics_window)),
-                "ema": float(max(0.0, min(1.0, args.metrics_ema))),
-                "title": "live_mvp | training metrics",
-            }
-            try:
-                metrics_q.put_nowait(init_msg)
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"[metrics] failed to start viewer: {e!r}")
-            metrics_q = None
-            metrics_proc = None
+    # ---- Metrics: route into the same viewer (right pane) ----
+    if args.viz:
+        metrics_q = viz_q
+
+    # Helper: route a log line to the viewer (best-effort)
+    def _viz_log(msg: str):
+        # Disabled: keep a single-window viewer focused on map + metrics
+        return
 
     def _apply_preset(name, rcfg: RenderCfg, sim: SimCfg):
         if name == "safe":
@@ -1038,17 +1053,23 @@ def main(argv: Optional[list] = None):
     sim = sim._replace(steps=horizon)
 
     # small banner so runs are self-describing
-    print(f"[cfg] preset={args.preset or 'none'} | "
-          f"Sim: steps={sim.steps}  w_coll={sim.w_coll}  w_ctrl={sim.w_ctrl}  "
-          f"w_recon={sim.w_recon}  margin={sim.margin}  act_noise={sim.act_noise}")
-    print(f"[cfg] R: t0={sim.rcfg.t0} t1={sim.rcfg.t1} S={sim.rcfg.S} eps={sim.rcfg.eps_shell}  "
-          f"θ∈[{sim.rcfg.theta_min_deg},{sim.rcfg.theta_max_deg}] τθ={sim.rcfg.tau_theta}  "
-          f"r0={sim.rcfg.r0} τr={sim.rcfg.tau_r}  γ_unseen={sim.rcfg.unseen_gamma}")
-    print(f"[cfg] warmup: steps={sim.coll_warmup_steps} ramp={sim.coll_warmup_ramp} iters={sim.coll_warmup_iters}")
-    print(f"[cfg] bias/kinematics: geom_bias={args.geom_bias:.2f} | w_speed={sim.w_speed} | "
-          f"w_alt={sim.w_alt} z∈[{sim.z_min:.2f},{sim.z_max:.2f}] τz={sim.z_tau}")
-    print(f"[cfg] mapping: update_every={sim.map_update_every} ray_sub={sim.map_ray_sub} free_samples={sim.map_free_samples}")
-    print(f"[cfg] training horizon (per update): steps={sim.steps}  (override via --update-horizon)")
+    msg = (f"[cfg] preset={args.preset or 'none'} | "
+           f"Sim: steps={sim.steps}  w_coll={sim.w_coll}  w_ctrl={sim.w_ctrl}  "
+           f"w_recon={sim.w_recon}  margin={sim.margin}  act_noise={sim.act_noise}")
+    print(msg); _viz_log(msg)
+    msg = (f"[cfg] R: t0={sim.rcfg.t0} t1={sim.rcfg.t1} S={sim.rcfg.S} eps={sim.rcfg.eps_shell}  "
+           f"θ∈[{sim.rcfg.theta_min_deg},{sim.rcfg.theta_max_deg}] τθ={sim.rcfg.tau_theta}  "
+           f"r0={sim.rcfg.r0} τr={sim.rcfg.tau_r}  γ_unseen={sim.rcfg.unseen_gamma}")
+    print(msg); _viz_log(msg)
+    msg = (f"[cfg] warmup: steps={sim.coll_warmup_steps} ramp={sim.coll_warmup_ramp} iters={sim.coll_warmup_iters}")
+    print(msg); _viz_log(msg)
+    msg = (f"[cfg] bias/kinematics: geom_bias={args.geom_bias:.2f} | w_speed={sim.w_speed} | "
+           f"w_alt={sim.w_alt} z∈[{sim.z_min:.2f},{sim.z_max:.2f}] τz={sim.z_tau}")
+    print(msg); _viz_log(msg)
+    msg = (f"[cfg] mapping: update_every={sim.map_update_every} ray_sub={sim.map_ray_sub} free_samples={sim.map_free_samples}")
+    print(msg); _viz_log(msg)
+    msg = (f"[cfg] training horizon (per update): steps={sim.steps}  (override via --update-horizon)")
+    print(msg); _viz_log(msg)
 
     # Optional TensorBoard trace
     tracedir = args.profile.strip()
@@ -1062,13 +1083,14 @@ def main(argv: Optional[list] = None):
             tracedir = ""
 
     # Warm-up compile or first run (captures compile + first-exec time)
-    print("Compiling (first train_step)…")
+    print("Compiling (first train_step)…"); _viz_log("Compiling (first train_step)…")
     key, sub = jax.random.split(key)
     (policy_params, opt_state, mapstate, loss, metrics), t_compile = time_blocked(
         train_step, policy_params, opt_state, mapstate, states0, sub, sim, 0, gt_grid
     )
-    print(f"[timing] compile+first: {t_compile:.3f}s  "
-          f"(backend={jax.default_backend()}, device={dev})")
+    msg = (f"[timing] compile+first: {t_compile:.3f}s  "
+           f"(backend={jax.default_backend()}, device={dev})")
+    print(msg); _viz_log(msg)
 
     # Optional CSV (unbuffered-ish)
     csv_path = args.csv.strip()
@@ -1182,7 +1204,7 @@ def main(argv: Optional[list] = None):
             cws = float(metrics.get("coll_w_scale", 1.0))
             spd = float(metrics.get("speed_rms", 0.0))
             altp = float(metrics.get("alt_pen", 0.0))
-            print(
+            line = (
                 f"[{it:03d}] dt={dt_total*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
@@ -1191,14 +1213,14 @@ def main(argv: Optional[list] = None):
                 f"u_rms={urms_f:.3e} (u_nan={u_nan_f:.0f}) | obs_nan={obs_nan_f:.3f} | "
                 f"gprobe={gprobe_f:.3e} | grad_rms={grads_f:.3e} | grad_norm={gnorm:.3e} "
                 f"(pre={gnormpre:.3e}, finite={gfin_f:.2f}, gmax={gpremax:.2e}) | "
-                f"upd_rms={up_f:.3e} | upd_norm={unorm:.3e} | upd_max={umax:.2e} | prm={prms_f:.3e}",
-                flush=True,
+                f"upd_rms={up_f:.3e} | upd_norm={unorm:.3e} | upd_max={umax:.2e} | prm={prms_f:.3e}"
             )
+            print(line, flush=True); _viz_log(line)
         elif (it % 20 == 0) or (it == 1):
             cws = float(metrics.get("coll_w_scale", 1.0))
             spd = float(metrics.get("speed_rms", 0.0))
             altp = float(metrics.get("alt_pen", 0.0))
-            print(
+            line = (
                 f"[{it:03d}] dt={dt_total*1e3:7.1f} ms | wall={wall*1e3:7.1f} ms | gap={gap*1e3:6.1f} ms | "
                 f"env-steps/s={env_steps:8.1f} | drone-steps/s={drone_steps:8.1f} | "
                 f"loss={loss_f:.3e} (finite={loss_fin:.0f}) | recon={recon_f:.3e} | coll={coll_f:.3e} | ctrl={ctrl_f:.3e} | "
@@ -1207,9 +1229,9 @@ def main(argv: Optional[list] = None):
                 f"u_rms={urms_f:.3e} (u_nan={u_nan_f:.0f}) | obs_nan={obs_nan_f:.3f} | "
                 f"gprobe={gprobe_f:.3e} | grad_rms={grads_f:.3e} | grad_norm={gnorm:.3e} "
                 f"(pre={gnormpre:.3e}, finite={gfin_f:.2f}, gmax={gpremax:.2e}) | "
-                f"upd_rms={up_f:.3e} | upd_norm={unorm:.3e} | upd_max={umax:.2e} | prm={prms_f:.3e}",
-                flush=True,
+                f"upd_rms={up_f:.3e} | upd_norm={unorm:.3e} | upd_max={umax:.2e} | prm={prms_f:.3e}"
             )
+            print(line, flush=True); _viz_log(line)
 
         # ---- Viewer snapshot ----
         if viz_q is not None and (it % max(1, int(args.viz_every)) == 0):
@@ -1231,6 +1253,52 @@ def main(argv: Optional[list] = None):
                         viz_q.put_nowait(msg)
                     except Exception:
                         pass
+                # --- Live reconstruction field on the coarse grid (middle pane) ---
+                try:
+                    # Evaluate on device then bring back once
+                    pts_dev = jnp.asarray(live_pts_viz)  # small enough to copy
+                    G_dev = v_G(pts_dev, map_iter.geom.theta)              # phi
+                    Q_dev = v_Q(pts_dev, map_iter.expo.eta)                # exposure
+                    absG = jnp.abs(G_dev)
+                    mask = 1.0 - jnp.clip(absG / jnp.asarray(sim.rcfg.eps_shell, jnp.float32), 0.0, 1.0)
+                    mode = str(args.viz_field or "Q")
+                    field_dev = jnp.where(jnp.array(0), 0.0, 0.0)  # dummy init for shape
+                    idx = {"Q": 0, "vis": 1, "phi": 2, "mask": 3, "solid": 4}.get(mode, 0)
+                    field_dev = jax.lax.switch(
+                        idx,
+                        [
+                            lambda: Q_dev,
+                            lambda: jnp.clip(Q_dev * mask, 0.0, 1.0),
+                            lambda: absG,
+                            lambda: mask,
+                            lambda: 1.0 - Q_dev,
+                        ],
+                    )
+                    field = np.asarray(jax.device_get(field_dev), dtype=np.float32)
+                    # robust clim hint (2–98 %)
+                    finite = field[np.isfinite(field)]
+                    if finite.size:
+                        lo, hi = np.percentile(finite, [2.0, 98.0]).tolist()
+                        if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+                            lo, hi = float(np.nanmin(finite)), float(np.nanmax(finite))
+                            if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+                                lo, hi = 0.0, 1.0
+                    else:
+                        lo, hi = 0.0, 1.0
+                    live_msg = {"type": "live", "field": field, "name": mode, "clim_hint": [float(lo), float(hi)]}
+                    try:
+                        viz_q.put_nowait(live_msg)
+                    except Exception:
+                        try:
+                            _ = viz_q.get_nowait()
+                        except Exception:
+                            pass
+                        try:
+                            viz_q.put_nowait(live_msg)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"[viz] live map snapshot failed at iter {it}: {e!r}")
             except Exception as e:
                 print(f"[viz] snapshot failed at iter {it}: {e!r}")
 
@@ -1256,12 +1324,16 @@ def main(argv: Optional[list] = None):
         env_sps_med  = sim.steps / max(1e-9, med_dt)
         env_sps_p95  = sim.steps / max(1e-9, p95_dt)
         drones = int(states0.p.shape[0])
-        print("\n=== Timing summary ===")
-        print(f"compile+first: {t_compile:.3f} s")
-        print(f"steady-state per train_step: mean={mean_dt:.4f}s  median={med_dt:.4f}s  p95={p95_dt:.4f}s")
-        print(f"env-steps/s   : mean={env_sps_mean:,.1f}  median={env_sps_med:,.1f}  p95={env_sps_p95:,.1f}")
-        print(f"drone-steps/s : mean={(env_sps_mean*drones):,.1f}  "
-              f"median={(env_sps_med*drones):,.1f}  p95={(env_sps_p95*drones):,.1f}  (N={drones}, steps={sim.steps})")
+        print("\n=== Timing summary ==="); _viz_log("=== Timing summary ===")
+        msg = f"compile+first: {t_compile:.3f} s"; print(msg); _viz_log(msg)
+        msg = (f"steady-state per train_step: mean={mean_dt:.4f}s  "
+               f"median={med_dt:.4f}s  p95={p95_dt:.4f}s")
+        print(msg); _viz_log(msg)
+        msg = (f"env-steps/s   : mean={env_sps_mean:,.1f}  median={env_sps_med:,.1f}  p95={env_sps_p95:,.1f}")
+        print(msg); _viz_log(msg)
+        msg = (f"drone-steps/s : mean={(env_sps_mean*drones):,.1f}  "
+               f"median={(env_sps_med*drones):,.1f}  p95={(env_sps_p95*drones):,.1f}  (N={drones}, steps={sim.steps})")
+        print(msg); _viz_log(msg)
 
     if csv_fh:
         csv_fh.close()
