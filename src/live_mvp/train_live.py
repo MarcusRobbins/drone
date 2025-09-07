@@ -8,6 +8,7 @@ import numpy as np
 
 from .env_gt import raycast_depth_gt
 from .env_gt import build_gt_grid, raycast_depth_grid as raycast_depth_grid_cached
+from .env_gt import set_gt_config, get_gt_config
 from .live_map import init_live_map, update_geom, update_expo, MapState, GeomState, ExpoState, HASH_CFG, G_phi
 from .render import RenderCfg, recon_reward_for_ray
 from .dyn import State, DynCfg, step, body_rays_world, R_from_q
@@ -713,6 +714,9 @@ def main(argv: Optional[list] = None):
     parser.add_argument("--timing", action="store_true", help="Print timing each iteration and summary.")
     parser.add_argument("--profile", type=str, default="", help="Start TensorBoard trace to this directory.")
     parser.add_argument("--csv", type=str, default="", help="Write per-iter metrics to CSV.")
+    # ----- GT world toggles -----
+    parser.add_argument("--no-ground-plane", action="store_true",
+                        help="Disable the z=0 ground plane in the GT SDF (keeps only sphere + box).")
     # ----- Stability shaping: map bias, speed, altitude -----
     parser.add_argument("--geom-bias", type=float, default=0.0,
                         help="Initial bias for geometry SDF head final layer (default: 0.0)")
@@ -797,6 +801,14 @@ def main(argv: Optional[list] = None):
     # Prefer to place initial arrays directly on GPU if available
     dev = _pick_first_device()
     with jax.default_device(dev):
+        # ---- Apply GT config BEFORE any builds/JITs ----
+        if args.no_ground_plane:
+            set_gt_config(False)
+        # Print once so runs are self-describing
+        try:
+            print(f"[cfg] gt.include_plane={get_gt_config().include_plane}")
+        except Exception:
+            pass
         key = jax.random.PRNGKey(0)
         mapstate = init_live_map(key, geom_bias=float(args.geom_bias))
 

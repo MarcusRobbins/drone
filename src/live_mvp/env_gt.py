@@ -1,6 +1,8 @@
+import os
+from dataclasses import dataclass
 import jax, jax.numpy as jnp
 import numpy as np
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 def smin(a, b, k=8.0):
     return -jnp.log(jnp.exp(-k*a) + jnp.exp(-k*b) + 1e-12) / k
@@ -12,16 +14,50 @@ def sd_box(x, h):
     inside  = jnp.minimum(jnp.max(q, axis=-1), 0.0)
     return outside + inside
 
+# -------- Ground-truth config (module-local, process-wide) --------
+@dataclass(frozen=True)
+class GTConfig:
+    include_plane: bool = True  # default ON (preserves current tests/behavior)
+
+
+def _env_truthy(name: str, default: bool) -> bool:
+    v = os.environ.get(name, "")
+    if not v:
+        return default
+    return v.lower() in ("1", "true", "yes", "on", "y", "t")
+
+
+# Read once at import time; can be overridden programmatically via set_gt_config.
+_GT_CFG = GTConfig(include_plane=_env_truthy("LIVEMVP_GROUND_PLANE", True))
+
+
+def get_gt_config() -> GTConfig:
+    return _GT_CFG
+
+
+def set_gt_config(include_plane: Optional[bool] = None) -> GTConfig:
+    """
+    Override GT config for this process. Must be called before building grids / JITs.
+    """
+    global _GT_CFG
+    if include_plane is not None:
+        _GT_CFG = GTConfig(include_plane=bool(include_plane))
+    return _GT_CFG
+
+
 def phi_gt(x):
-    # Ground plane z=0 (positive above)
-    phi_plane = x[2]
     # Sphere
     c_sph = jnp.array([3.0, 0.0, 1.0]); r_sph = 1.0
     phi_sphere = jnp.linalg.norm(x - c_sph) - r_sph
     # Box
     c_box = jnp.array([1.6, -1.4, 0.7]); he = jnp.array([0.6, 0.6, 0.8])
     phi_box = sd_box(x - c_box, he)
-    return smin(smin(phi_plane, phi_sphere), phi_box)
+    if _GT_CFG.include_plane:
+        # Ground plane z=0 (positive above)
+        phi_plane = x[2]
+        return smin(smin(phi_plane, phi_sphere), phi_box)
+    else:
+        return smin(phi_sphere, phi_box)
 
 def raycast_depth_gt(o, d, t_max=12.0, eps=1e-3, iters=64):
     """
@@ -80,7 +116,7 @@ def build_gt_grid(lb: jnp.ndarray, ub: jnp.ndarray, res_xyz=(160, 160, 80), use_
         ys = np.linspace(lb_np[1], ub_np[1], int(res_np[1]), dtype=np.float32)
         zs = np.linspace(lb_np[2], ub_np[2], int(res_np[2]), dtype=np.float32)
         X, Y, Z = np.meshgrid(xs, ys, zs, indexing='xy')
-        # Analytic SDF in NumPy
+        # Analytic SDF in NumPy (honor config)
         phi_plane = Z
         c_sph = np.array([3.0, 0.0, 1.0], np.float32); r_sph = 1.0
         phi_sphere = np.linalg.norm(np.stack([X - c_sph[0], Y - c_sph[1], Z - c_sph[2]], axis=-1), axis=-1) - r_sph
@@ -95,7 +131,10 @@ def build_gt_grid(lb: jnp.ndarray, ub: jnp.ndarray, res_xyz=(160, 160, 80), use_
         # smin with k=8.0
         def smin_np(a, b, k=8.0):
             return -np.log(np.exp(-k * a) + np.exp(-k * b) + 1e-12) / k
-        phi_np = smin_np(smin_np(phi_plane, phi_sphere), phi_box).astype(np.float32)
+        if _GT_CFG.include_plane:
+            phi_np = smin_np(smin_np(phi_plane, phi_sphere), phi_box).astype(np.float32)
+        else:
+            phi_np = smin_np(phi_sphere, phi_box).astype(np.float32)
         dx_np = (ub_np - lb_np) / (res_np.astype(np.float32) - 1.0)
         return GTGrid(
             lb=jnp.asarray(lb_np),
