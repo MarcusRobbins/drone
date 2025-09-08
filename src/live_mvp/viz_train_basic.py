@@ -162,6 +162,7 @@ class BasicTrainViewer:
         self.live_thresh_alpha = 1.0  # show points with value <= this threshold
         self.live_field_last: Optional[np.ndarray] = None
         self._live_thresh_user_set = False
+        self.live_seq: Optional[np.ndarray] = None  # (T,M) sequence for per-frame updates
         try:
             self.pl.subplot(0, 1)
             self.pl.show_axes()
@@ -459,11 +460,30 @@ class BasicTrainViewer:
         pd = self.live_poly.point_data
         n = int(self.live_poly.n_points)
         if masked.size != n:
-            masked = np.resize(masked.astype(np.float32), n)
-        if "live" in pd and int(pd["live"].size) == n:
-            pd["live"][:] = masked
-        else:
-            pd["live"] = masked
+            masked = np.resize(masked.astype(np.float32, copy=False), n)
+        # Replace array to trigger VTK 'Modified' reliably on all backends
+        pd["live"] = np.ascontiguousarray(masked, dtype=np.float32)
+        # Explicitly mark 'live' as active scalars to avoid mapper cache issues
+        try:
+            self.live_poly.point_data.set_active('live')
+        except Exception:
+            pass
+        try:
+            self.live_poly.Modified()
+        except Exception:
+            pass
+        try:
+            if self.live_actor is not None and hasattr(self.live_actor, "mapper"):
+                self.live_actor.mapper.Modified()
+                # One-time binding: ensure mapper points at the 'live' array
+                if not getattr(self, "_live_mapper_bound_once", False):
+                    try:
+                        self.live_actor.mapper.SetArrayName("live")
+                    except Exception:
+                        pass
+                    self._live_mapper_bound_once = True
+        except Exception:
+            pass
 
         # 2) Auto color limits from the visible subset only
         if self.live_auto_clim:
@@ -490,6 +510,28 @@ class BasicTrainViewer:
     def update_live_values(self, field: np.ndarray, clim_hint: Optional[list] = None):
         """Update per-point live field values subject to threshold; auto-scale from visible subset."""
         self._update_live_scalars(field, clim_hint)
+
+    def set_live_seq(self, field_seq: np.ndarray, clim_hint: Optional[list]):
+        fs = np.asarray(field_seq, dtype=np.float32)
+        if fs.ndim == 1:
+            fs = fs[None, :]
+        self.live_seq = fs  # (T,M)
+        # apply first frame immediately
+        if fs.shape[0] > 0:
+            v0 = fs[0]
+            try:
+                f = v0[np.isfinite(v0)]
+                if f.size:
+                    print("[viewer] frame0 stats:", float(np.nanmin(f)), float(np.nanmean(f)), float(np.nanmax(f)))
+            except Exception:
+                pass
+            self._update_live_scalars(v0, clim_hint)
+
+    def update_live_frame(self, idx: int):
+        if self.live_seq is None:
+            return
+        i = int(max(0, min(int(idx), int(self.live_seq.shape[0] - 1))))
+        self._update_live_scalars(self.live_seq[i], None)
 
     def _update_live_slider_range(self, lo: float, hi: float):
         # Create slider on-demand in the middle pane
@@ -747,6 +789,7 @@ class BasicTrainViewer:
                 if self.pb.step_if_due() and self.pb.p_seq is not None:
                     self.update_drones(self.pb.p_seq[self.pb.idx])
                     self.update_arrows()
+                    self.update_live_frame(self.pb.idx)
                     self.update_hud()
                     try:
                         self.pl.render()
@@ -809,6 +852,10 @@ class BasicTrainViewer:
                     field = np.asarray(m.get("field", np.zeros((0,), np.float32)), np.float32)
                     clim_hint = m.get("clim_hint", None)
                     self.update_live_values(field, clim_hint)
+                    need_render = True
+                elif tp == "live_seq":
+                    fs = np.asarray(m.get("field_seq", np.zeros((0,), np.float32)))
+                    self.set_live_seq(fs, m.get("clim_hint", None))
                     need_render = True
                 elif tp == "metrics":
                     self.on_metrics(int(m.get("iter", 0)), dict(m.get("scalars", {})))

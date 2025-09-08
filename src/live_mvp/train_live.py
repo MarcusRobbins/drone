@@ -701,6 +701,99 @@ def _rollout_for_viz(policy_params, mapstate, states0, key, sim: SimCfg, steps: 
     return p_seq, q_seq
 
 
+# Module-level map sanitizer for viewer/replay paths
+def _sanitize_mapstate_mod(ms: MapState, max_abs: float = 1e3) -> MapState:
+    def clean(x):
+        x = jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        return jnp.clip(x, -max_abs, max_abs)
+    theta = jtu.tree_map(clean, ms.geom.theta)
+    eta = jtu.tree_map(clean, ms.expo.eta)
+    return MapState(GeomState(theta, ms.geom.opt), ExpoState(eta, ms.expo.opt))
+
+
+# Compute the live field at each playback frame by replaying mapping updates on a coarse grid.
+@partial(jax.jit, static_argnames=("sim", "mode_idx"))
+def _live_field_seq_for_viz(map0: MapState,
+                            p_seq: jnp.ndarray,   # (T,N,3)
+                            q_seq: jnp.ndarray,   # (T,N,4)
+                            sim: SimCfg,
+                            viz_pts: jnp.ndarray, # (M,3)
+                            mode_idx: int,
+                            gt_grid=None):
+    SFS = int(sim.map_free_samples)
+    ts = jnp.linspace(sim.rcfg.t0, sim.rcfg.t1, SFS)
+    ray_idx = jnp.arange(0, RAYS_BODY.shape[0], int(sim.map_ray_sub))
+
+    def per_ray(o, d):
+        # Use the same GT raycaster choice as training
+        if gt_grid is not None:
+            t_hit = raycast_depth_grid_cached(o, d, gt_grid, t_max=sim.rcfg.t1, eps=0.01, iters=48)
+        else:
+            t_hit = raycast_depth_gt(o, d)
+        stop_t = jnp.where(jnp.isnan(t_hit), sim.rcfg.t1, t_hit)
+        xs = o[None, :] + ts[:, None] * d[None, :]
+        m_free = (ts < stop_t).astype(jnp.float32)
+        w_free = m_free / (1.0 + ts * ts)
+        m_occ  = (ts > stop_t).astype(jnp.float32)
+        w_occ  = m_occ / (1.0 + ts * ts)
+        x_hit = o + stop_t * d
+        m_hit = jnp.isfinite(t_hit).astype(jnp.float32) * (t_hit <= sim.rcfg.t1)
+        return x_hit, m_hit, xs, m_free, xs, m_occ, w_free, w_occ
+
+    def collect(p_t, q_t):
+        rays_all = jax.vmap(lambda q: body_rays_world(q, RAYS_BODY))(q_t)  # (N,M,3)
+        sel = rays_all[:, ray_idx, :]                                       # (N,M',3)
+        # vmaps: per drone then per selected ray
+        def per_drone(o, dirs):
+            return jax.vmap(lambda d: per_ray(o, d))(dirs)
+        hits, m_hits, frees, m_frees, occs, m_occs, w_frees, w_occs = jax.vmap(per_drone)(p_t, sel)
+
+        # Flatten drones/rays; keep sample dim S intact
+        def flat_R3(x):  return x.reshape(-1, x.shape[-1])
+        def flat_R(x):   return x.reshape(-1)
+        def flat_RS3(x): return x.reshape(-1, x.shape[-2], x.shape[-1])
+        def flat_RS(x):  return x.reshape(-1, x.shape[-1])
+
+        return (flat_R3(hits), flat_R(m_hits),
+                flat_RS3(frees), flat_RS(m_frees),
+                flat_RS3(occs),  flat_RS(m_occs),
+                flat_RS(w_frees), flat_RS(w_occs))
+
+    pts = jnp.asarray(viz_pts, jnp.float32)
+
+    def step(carry, t):
+        ms = carry
+        p_t = p_seq[t]; q_t = q_seq[t]
+
+        def do_map(ms_in):
+            h, mh, fr, mfr, oc, moc, wfr, woc = collect(p_t, q_t)
+            ms1 = update_geom(ms_in, h, mh, fr, mfr)
+            ms1 = update_expo(ms1, fr, wfr, oc, woc, neg_weight=0.7)
+            # match training: stop grads + sanitize to avoid NaNs/bad scales
+            ms1 = jtu.tree_map(jax.lax.stop_gradient, ms1)
+            ms1 = _sanitize_mapstate_mod(ms1)
+            return ms1
+
+        ms = jax.lax.cond((t % int(sim.map_update_every)) == 0, do_map, lambda x: x, ms)
+
+        G = v_G(pts, ms.geom.theta)
+        Q = v_Q(pts, ms.expo.eta)
+        absG = jnp.abs(G)
+        mask = 1.0 - jnp.clip(absG / jnp.asarray(sim.rcfg.eps_shell, jnp.float32), 0.0, 1.0)
+
+        def _case_Q():     return Q
+        def _case_vis():   return jnp.clip(Q * mask, 0.0, 1.0)
+        def _case_phi():   return absG
+        def _case_mask():  return mask
+        def _case_solid(): return 1.0 - Q
+
+        field_t = jax.lax.switch(mode_idx, [_case_Q, _case_vis, _case_phi, _case_mask, _case_solid])
+        return ms, field_t  # (M,)
+
+    _, field_seq = jax.lax.scan(step, map0, jnp.arange(p_seq.shape[0]))  # (T,M)
+    return field_seq
+
+
 def main(argv: Optional[list] = None):
     parser = argparse.ArgumentParser(description="Train live_mvp policy with timing.")
     parser.add_argument("--drones", type=int, default=2, help="Number of drones N.")
@@ -941,6 +1034,19 @@ def main(argv: Optional[list] = None):
                 })
             except Exception as e:
                 print(f"[viz] send init failed: {e!r}")
+
+            # --- Warm up JIT for live field replay to avoid first-snapshot blue pane ---
+            try:
+                key, k_w1 = jax.random.split(key)
+                # 1-step rollout to establish shapes
+                p_warm, q_warm = _rollout_for_viz(policy_params, mapstate, states0, k_w1, sim, steps=1)
+                pts_warm = jnp.asarray(live_pts_viz[:64], jnp.float32)  # tiny subset compiles fast
+                mode_idx = {"Q": 0, "vis": 1, "phi": 2, "mask": 3, "solid": 4}.get(str(args.viz_field or "Q"), 0)
+                _ = _live_field_seq_for_viz(mapstate, p_warm, q_warm, sim, pts_warm, int(mode_idx), gt_grid)
+                _ = jax.device_get(_)
+                print("[viz] warmup: live field replay compiled")
+            except Exception as e:
+                print(f"[viz] warmup failed: {e!r}")
 
     # ---- Metrics: route into the same viewer (right pane) ----
     if args.viz:
@@ -1253,30 +1359,29 @@ def main(argv: Optional[list] = None):
                         viz_q.put_nowait(msg)
                     except Exception:
                         pass
-                # --- Live reconstruction field on the coarse grid (middle pane) ---
+                # --- Live reconstruction field sequence on the coarse grid (middle pane) ---
                 try:
-                    # Evaluate on device then bring back once
-                    pts_dev = jnp.asarray(live_pts_viz)  # small enough to copy
-                    G_dev = v_G(pts_dev, map_iter.geom.theta)              # phi
-                    Q_dev = v_Q(pts_dev, map_iter.expo.eta)                # exposure
-                    absG = jnp.abs(G_dev)
-                    mask = 1.0 - jnp.clip(absG / jnp.asarray(sim.rcfg.eps_shell, jnp.float32), 0.0, 1.0)
                     mode = str(args.viz_field or "Q")
-                    field_dev = jnp.where(jnp.array(0), 0.0, 0.0)  # dummy init for shape
-                    idx = {"Q": 0, "vis": 1, "phi": 2, "mask": 3, "solid": 4}.get(mode, 0)
-                    field_dev = jax.lax.switch(
-                        idx,
-                        [
-                            lambda: Q_dev,
-                            lambda: jnp.clip(Q_dev * mask, 0.0, 1.0),
-                            lambda: absG,
-                            lambda: mask,
-                            lambda: 1.0 - Q_dev,
-                        ],
-                    )
-                    field = np.asarray(jax.device_get(field_dev), dtype=np.float32)
+                    mode_idx = {"Q": 0, "vis": 1, "phi": 2, "mask": 3, "solid": 4}.get(mode, 0)
+                    # Start from current map so changes are immediately visible
+                    map_viz0 = map_iter
+                    pts_dev = jnp.asarray(live_pts_viz)
+                    field_seq_dev = _live_field_seq_for_viz(map_viz0, p_seq_dev, q_seq_dev, sim, pts_dev, int(mode_idx), gt_grid)
+                    field_seq = np.asarray(jax.device_get(field_seq_dev), dtype=np.float32)  # (T,M)
+                    # Tiny numeric summary for quick sanity check
+                    def _summ(a: np.ndarray):
+                        f = a[np.isfinite(a)]
+                        if f.size == 0:
+                            return "(all-NaN)"
+                        return f"min={f.min():.3e} mean={f.mean():.3e} max={f.max():.3e}"
+                    try:
+                        print("[viz] live field seq f0:", _summ(field_seq[0]))
+                        print("[viz] live field seq fT:", _summ(field_seq[-1]))
+                        print("[viz] Δ (mean abs):", float(np.nanmean(np.abs(field_seq[-1] - field_seq[0]))))
+                    except Exception:
+                        pass
                     # robust clim hint (2–98 %)
-                    finite = field[np.isfinite(field)]
+                    finite = field_seq[np.isfinite(field_seq)]
                     if finite.size:
                         lo, hi = np.percentile(finite, [2.0, 98.0]).tolist()
                         if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
@@ -1285,7 +1390,8 @@ def main(argv: Optional[list] = None):
                                 lo, hi = 0.0, 1.0
                     else:
                         lo, hi = 0.0, 1.0
-                    live_msg = {"type": "live", "field": field, "name": mode, "clim_hint": [float(lo), float(hi)]}
+                    live_msg = {"type": "live_seq", "field_seq": field_seq.astype(np.float32, copy=False),
+                                "name": mode, "clim_hint": [float(lo), float(hi)]}
                     try:
                         viz_q.put_nowait(live_msg)
                     except Exception:
